@@ -5,6 +5,9 @@ import contextlib
 import io
 import json
 import os
+import shlex
+import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -631,6 +634,36 @@ class KeylinkImageTests(unittest.TestCase):
                 "https://unrelated.example", "argument", ccswitch
             ), (None, None))
 
+    def test_ccswitch_credentials_from_home_with_spaces_and_uri_characters(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            user_home = Path(temporary) / "Mac User #1 %20"
+            db_path = user_home / ".cc-switch" / "cc-switch.db"
+            db_path.parent.mkdir(parents=True)
+            connection = sqlite3.connect(db_path)
+            try:
+                connection.executescript("""
+                    CREATE TABLE proxy_config (app_type TEXT, proxy_enabled INTEGER,
+                        listen_address TEXT, listen_port INTEGER, enabled INTEGER);
+                    CREATE TABLE providers (id TEXT, app_type TEXT, is_current INTEGER,
+                        sort_index INTEGER, settings_config TEXT, website_url TEXT);
+                    CREATE TABLE provider_endpoints (id INTEGER, app_type TEXT,
+                        provider_id TEXT, url TEXT);
+                """)
+                settings = json.dumps({"auth": {"OPENAI_API_KEY": "fixture-key-only"}})
+                connection.execute(
+                    "INSERT INTO providers VALUES (?, ?, ?, ?, ?, ?)",
+                    ("keylink", "codex", 1, 0, settings, "https://keylinkclub.com"),
+                )
+                connection.commit()
+            finally:
+                connection.close()
+            original = db_path.read_bytes()
+            with mock.patch.object(client_module.Path, "home", return_value=user_home):
+                state = client_module.discover_ccswitch_state()
+            self.assertEqual(state.api_key, "fixture-key-only")
+            self.assertEqual(state.provider_base_urls, ["https://keylinkclub.com"])
+            self.assertEqual(db_path.read_bytes(), original)
+
     def test_models_failure_is_reported_without_switching_servers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:
             server.routes[("GET", "/v1/models")] = json_response(
@@ -683,7 +716,10 @@ class KeylinkImageTests(unittest.TestCase):
     def test_powershell_launcher_preserves_chinese_prompt_in_request_body(self) -> None:
         powershell = Path(sys.executable).parents[1] / "native" / "powershell" / "pwsh.exe"
         if not powershell.is_file():
-            self.skipTest("Bundled PowerShell is unavailable")
+            installed = shutil.which("pwsh")
+            if not installed:
+                self.skipTest("PowerShell is unavailable")
+            powershell = Path(installed)
         prompt = "完整月球悬浮在深黑太空中，月海与陨石坑清晰可见，无文字。"
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:
             server.routes[("GET", "/v1/models")] = json_response(
@@ -714,6 +750,77 @@ class KeylinkImageTests(unittest.TestCase):
             body = json.loads(server.requests[0]["body"])
             self.assertEqual(body["prompt"], prompt)
             self.assertEqual(body["size"], "1024x1024")
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher integration")
+    def test_shell_launcher_preserves_prompt_and_paths_with_spaces(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            workspace = Path(temporary)
+            scripts = workspace / "Skill folder #1" / "scripts"
+            scripts.mkdir(parents=True)
+            for name in ("keylink_image.py", "keylink-image.sh"):
+                shutil.copy2(CLIENT.with_name(name), scripts / name)
+            env = os.environ.copy()
+            env.update(KEYLINK_PYTHON=sys.executable, CODEX_THREAD_ID="shell-test",
+                       NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
+            for name in ("KEYLINK_API_KEY", "OPENAI_API_KEY", "KEYLINK_IMAGE_STATE_DIR"):
+                env.pop(name, None)
+            server.routes[("GET", "/v1/models")] = json_response(
+                {"data": [{"id": "gpt-image-2"}]}
+            )
+            server.routes[("POST", "/v1/images/generations")] = json_response(
+                {"data": [{"b64_json": PNG_B64}]}
+            )
+            launcher = ["sh", str(scripts / "keylink-image.sh")]
+            base = ["--base-url", f"http://127.0.0.1:{server.server_address[1]}"]
+            discovered = subprocess.run(launcher + ["models"] + base, cwd=workspace,
+                                        env=env, capture_output=True, text=True,
+                                        encoding="utf-8", timeout=15)
+            self.assertEqual(discovered.returncode, 0, discovered.stdout + discovered.stderr)
+            token = json.loads(discovered.stdout)["selection_token"]
+            prompt = '海边的灯塔，保留 "蓝色" 天空与 $符号。'
+            completed = subprocess.run(
+                launcher + ["run", "--prompt", prompt, "--model", "gpt-image-2",
+                            "--selection-token", token] + base,
+                cwd=workspace, env=env, capture_output=True, text=True,
+                encoding="utf-8", timeout=15,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertEqual(json.loads(server.requests[-1]["body"])["prompt"], prompt)
+            result = json.loads(completed.stdout)
+            self.assertTrue(Path(result["images"][0]["path"]).is_file())
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher integration")
+    def test_shell_launcher_discovers_skill_virtual_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            skill_dir = Path(temporary) / "Skill with spaces"
+            shutil.copytree(CLIENT.parent, skill_dir / "scripts", ignore=shutil.ignore_patterns("__pycache__"))
+            interpreter = skill_dir / ".venv" / "bin" / "python3"
+            interpreter.parent.mkdir(parents=True)
+            interpreter.write_text(
+                "#!/bin/sh\nprintf '%s\\n' used-skill-venv >&2\nexec "
+                + shlex.quote(sys.executable) + ' "$@"\n', encoding="utf-8",
+            )
+            interpreter.chmod(0o755)
+            env = os.environ.copy()
+            env.pop("KEYLINK_PYTHON", None)
+            completed = subprocess.run(
+                ["sh", str(skill_dir / "scripts" / "keylink-image.sh"), "--help"],
+                cwd=temporary, env=env, capture_output=True, text=True, timeout=15,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            self.assertIn("models", completed.stdout)
+            self.assertIn("used-skill-venv", completed.stderr)
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher integration")
+    def test_shell_launcher_rejects_invalid_explicit_python(self) -> None:
+        env = dict(os.environ, KEYLINK_PYTHON="/nonexistent/keylink-python")
+        completed = subprocess.run(
+            ["sh", str(CLIENT.with_name("keylink-image.sh")), "--help"],
+            env=env, capture_output=True, text=True, timeout=15,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("KEYLINK_PYTHON", completed.stderr)
+        self.assertIn("3.11", completed.stderr)
 
     def test_correction_intent_reuses_thread_scoped_successful_image(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:

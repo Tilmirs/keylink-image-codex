@@ -154,7 +154,7 @@ def discover_ccswitch_state() -> CCSwitchState:
 
     connection: sqlite3.Connection | None = None
     try:
-        uri = f"file:{db_path.as_posix()}?mode=ro"
+        uri = db_path.resolve().as_uri() + "?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=1)
         connection.row_factory = sqlite3.Row
 
