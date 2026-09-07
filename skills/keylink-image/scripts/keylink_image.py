@@ -704,6 +704,7 @@ def save_last_state(
     model: str,
     endpoint: str,
     requested_size: str,
+    result: dict[str, Any] | None = None,
 ) -> None:
     state_dir.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -713,6 +714,8 @@ def save_last_state(
         "requested_size": requested_size,
         "saved_at": dt.datetime.now(dt.timezone.utc).isoformat(),
     }
+    if result is not None:
+        payload["result"] = result
     target = state_dir / "last.json"
     temporary = state_dir / f".last-{uuid.uuid4().hex}.json"
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -1012,6 +1015,91 @@ def model_catalog(client: HttpClient) -> list[dict[str, Any]]:
     return format_model_catalog(payload)
 
 
+def prepare_display(
+    saved: list[dict[str, Any]], preview_dir: Path | None = None
+) -> list[str]:
+    warnings: list[str] = []
+    for item in saved:
+        path = Path(item["path"]).resolve()
+        display_path = path
+        item.pop("preview_path", None)
+        item.pop("preview_width", None)
+        item.pop("preview_height", None)
+        if item["bytes"] > 4 * 1024 * 1024 or max(
+            item.get("width") or 0, item.get("height") or 0
+        ) > 2048:
+            try:
+                from PIL import Image, ImageOps
+
+                destination = preview_dir or path.parent / ".previews"
+                destination.mkdir(parents=True, exist_ok=True)
+                preview = destination / f"{path.stem}-{hashlib.sha256(str(path).encode()).hexdigest()[:8]}.preview.jpg"
+                with Image.open(path) as original:
+                    thumbnail = ImageOps.exif_transpose(original)
+                    thumbnail.thumbnail((1600, 1600), Image.Resampling.LANCZOS)
+                    rgba = thumbnail.convert("RGBA")
+                    background = Image.new("RGB", rgba.size, "white")
+                    background.paste(rgba, mask=rgba.getchannel("A"))
+                    background.save(preview, "JPEG", quality=85, optimize=True)
+                display_path = preview.resolve()
+                item.update(
+                    preview_path=str(display_path),
+                    preview_width=background.width,
+                    preview_height=background.height,
+                )
+            except (ImportError, OSError, ValueError) as error:
+                warnings.append(
+                    f"Image saved, but a display preview could not be created: {error}. "
+                    "Use the original file link; do not regenerate the image."
+                )
+        item["display_path"] = str(display_path)
+        item["display_markdown"] = f"![Image preview](<{display_path.as_posix()}>)"
+        item["original_markdown"] = f"[Original image](<{path.as_posix()}>)"
+    return warnings
+
+
+def command_last(args: argparse.Namespace) -> int:
+    thread_id = resolve_thread_id(args.thread_id)
+    state_dir = thread_state_dir(thread_id)
+    state = read_json_file(state_dir / "last.json")
+    first_path = load_last_image(state_dir)
+    result = state.get("result")
+    if not isinstance(result, dict):
+        result = {
+            "model": state.get("model"),
+            "endpoint": state.get("endpoint"),
+            "requested_size": state.get("requested_size"),
+            "images": [{"path": str(first_path)}],
+        }
+    saved = []
+    for item in result.get("images", []):
+        path = Path(item["path"])
+        try:
+            raw = path.read_bytes()
+        except OSError as error:
+            raise ClientError(f"Cannot read saved image {path}: {error}") from error
+        mime = detect_mime_type(raw)
+        if not mime:
+            raise ClientError(f"Saved file is not a recognized image: {path}")
+        dimensions = detect_dimensions(raw, mime)
+        saved.append({
+            "path": str(path.resolve()), "mime_type": mime, "bytes": len(raw),
+            "width": dimensions[0] if dimensions else None,
+            "height": dimensions[1] if dimensions else None,
+        })
+    if not saved:
+        raise ClientError("No image files are recorded for the latest result.")
+    preview_dir = Path(args.preview_dir).expanduser().resolve() if args.preview_dir else None
+    warnings = list(result.get("warnings", []))
+    warnings.extend(prepare_display(saved, preview_dir))
+    result.update(
+        status="ok", recovered=True, thread_id=thread_id,
+        saved_at=state.get("saved_at"), images=saved, warnings=warnings,
+    )
+    emit(result)
+    return 0
+
+
 def command_models(args: argparse.Namespace) -> int:
     base_url, base_source, ccswitch = discover_base_url(args.base_url)
     api_key, credential_source = discover_api_key(base_url, base_source, ccswitch)
@@ -1138,7 +1226,6 @@ def command_run(args: argparse.Namespace) -> int:
                 candidates, client, output_dir, model, endpoint_label
             )
             first_path = Path(saved[0]["path"])
-            save_last_state(state_dir, first_path, model, endpoint_label, size)
 
             warnings: list[str] = []
             if attempts:
@@ -1151,8 +1238,8 @@ def command_run(args: argparse.Namespace) -> int:
                     "Chat accepted the request, but the requested pixel dimensions are not guaranteed."
                 )
 
-            emit(
-                {
+            warnings.extend(prepare_display(saved))
+            result = {
                     "status": "ok",
                     "model": model,
                     "endpoint": endpoint_label,
@@ -1167,7 +1254,8 @@ def command_run(args: argparse.Namespace) -> int:
                     "failed_attempts": attempts,
                     "warnings": warnings,
                 }
-            )
+            save_last_state(state_dir, first_path, model, endpoint_label, size, result)
+            emit(result)
             return 0
         except ClientError as error:
             attempts.append({"endpoint": endpoint_label, "error": str(error)})
@@ -1199,6 +1287,11 @@ def build_parser() -> argparse.ArgumentParser:
     models.add_argument("--thread-id")
     models.add_argument("--timeout", type=float, default=120.0)
     models.set_defaults(handler=command_models)
+
+    last = subparsers.add_parser("last", help="Recover saved images locally without API requests.")
+    last.add_argument("--thread-id")
+    last.add_argument("--preview-dir", help="Directory for small display copies; originals are preserved.")
+    last.set_defaults(handler=command_last)
 
     run = subparsers.add_parser("run", help="Generate or edit an image.")
     run.add_argument("--prompt", required=True)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import io
 import json
 import os
 import subprocess
@@ -20,6 +21,10 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 CLIENT = WORKSPACE_ROOT / "skills" / "keylink-image" / "scripts" / "keylink_image.py"
 sys.path.insert(0, str(CLIENT.parent))
 import keylink_image as client_module
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
@@ -107,6 +112,7 @@ class KeylinkImageTests(unittest.TestCase):
         env["CODEX_THREAD_ID"] = thread_id
         env.pop("KEYLINK_API_KEY", None)
         env.pop("OPENAI_API_KEY", None)
+        env.pop("KEYLINK_IMAGE_STATE_DIR", None)
         base_url = f"http://127.0.0.1:{server.server_address[1]}"
         effective_args = list(args)
         if effective_args and effective_args[0] == "run" and auto_select:
@@ -143,8 +149,7 @@ class KeylinkImageTests(unittest.TestCase):
                 sys.executable,
                 str(CLIENT),
                 *effective_args,
-                "--base-url",
-                base_url,
+                *([] if args[0] == "last" else ["--base-url", base_url]),
             ],
             cwd=workspace,
             env=env,
@@ -202,6 +207,114 @@ class KeylinkImageTests(unittest.TestCase):
                 self.assertEqual(body["model"], "gpt-image-2")
                 self.assertEqual(body["size"], "1024x1024")
             self.assertTrue(Path(payload["images"][0]["path"]).is_file())
+
+    def test_last_recovers_all_saved_images_without_api_or_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            workspace = Path(temporary)
+            # Different image bytes prevent response deduplication.
+            second_b64 = base64.b64encode(PNG_BYTES + b"\n").decode("ascii")
+            server.routes[("POST", "/v1/images/generations")] = json_response(
+                {"data": [{"b64_json": PNG_B64}, {"b64_json": second_b64}]}
+            )
+            first, generated = self.run_client(
+                workspace, server, "run", "--prompt", "a landscape", "--model", "gpt-image-2"
+            )
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            server.requests.clear()
+            last, recovered = self.run_client(workspace, server, "last")
+            self.assertEqual(last.returncode, 0, last.stdout + last.stderr)
+            self.assertTrue(recovered["recovered"])
+            self.assertEqual(recovered["images"], generated["images"])
+            self.assertEqual(len(recovered["images"]), 2)
+            self.assertEqual(server.requests, [])
+            for item in recovered["images"]:
+                self.assertNotIn("\\", item["display_markdown"])
+                self.assertIn(Path(item["path"]).as_posix(), item["original_markdown"])
+            other, error = self.run_client(workspace, server, "last", thread_id="other-task")
+            self.assertEqual(other.returncode, 1)
+            self.assertIn("No successful image", error["error"])
+
+    @unittest.skipIf(Image is None, "Pillow display previews are optional")
+    def test_last_recovers_legacy_4k_result_and_preserves_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            workspace = Path(temporary)
+            original = workspace / "original 4k.png"
+            Image.new("RGB", (3840, 2160), "orange").save(original)
+            before = original.read_bytes()
+            state_dir = workspace / ".keylink-image" / "threads" / "test-thread"
+            state_dir.mkdir(parents=True)
+            state_path = state_dir / "last.json"
+            state_path.write_text(json.dumps({
+                "path": str(original), "model": "gpt-image-2", "endpoint": "images-edits",
+                "requested_size": "3840x2160", "saved_at": "2026-09-07T08:14:27Z",
+            }), encoding="utf-8")
+            state_before = state_path.read_bytes()
+            completed, result = self.run_client(
+                workspace, server, "last", "--preview-dir", str(workspace / "previews")
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            item = result["images"][0]
+            self.assertEqual((item["width"], item["height"]), (3840, 2160))
+            with Image.open(item["preview_path"]) as preview:
+                preview.load()
+                self.assertEqual(preview.size, (1600, 900))
+            self.assertLess(Path(item["preview_path"]).stat().st_size, 1024 * 1024)
+            self.assertEqual(original.read_bytes(), before)
+            self.assertEqual(state_path.read_bytes(), state_before)
+            self.assertEqual(client_module.load_last_image(state_dir), original)
+            self.assertEqual(server.requests, [])
+            original.unlink()
+            failed, error = self.run_client(workspace, server, "last")
+            self.assertEqual(failed.returncode, 1)
+            self.assertIn("no longer exists", error["error"])
+
+    @unittest.skipIf(Image is None, "Pillow display previews are optional")
+    def test_generation_saves_preview_but_next_edit_uses_4k_original(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            workspace = Path(temporary)
+            raw = io.BytesIO()
+            Image.new("RGB", (3840, 2160), "red").save(raw, "PNG")
+            server.routes[("POST", "/v1/images/generations")] = json_response(
+                {"data": [{"b64_json": base64.b64encode(raw.getvalue()).decode("ascii")}]}
+            )
+            completed, result = self.run_client(
+                workspace, server, "run", "--prompt", "a landscape", "--model", "gpt-image-2",
+                "--size", "3840x2160", "--confirm-high-res",
+            )
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            original = result["images"][0]["path"]
+            self.assertNotEqual(original, result["images"][0]["display_path"])
+            server.routes[("POST", "/v1/images/edits")] = json_response(
+                {"data": [{"b64_json": PNG_B64}]}
+            )
+            edited, edit_result = self.run_client(
+                workspace, server, "run", "--prompt", "change only the sky", "--model", "gpt-image-2",
+            )
+            self.assertEqual(edited.returncode, 0, edited.stdout + edited.stderr)
+            self.assertEqual(edit_result["references"], [original])
+            self.assertIn(raw.getvalue(), server.requests[0]["body"])
+
+    def test_missing_pillow_keeps_original_deliverable(self) -> None:
+        saved = [{"path": str(Path("original.png").resolve()), "bytes": 12000000,
+                  "width": 3840, "height": 2160}]
+        with mock.patch.dict(sys.modules, {"PIL": None}):
+            warnings = client_module.prepare_display(saved)
+        self.assertTrue(warnings)
+        self.assertEqual(saved[0]["display_path"], saved[0]["path"])
+        self.assertNotIn("preview_path", saved[0])
+
+    @unittest.skipIf(Image is None, "Pillow display previews are optional")
+    def test_preview_write_failure_keeps_original_deliverable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original = Path(temporary) / "original.png"
+            Image.new("RGB", (3840, 2160), "red").save(original)
+            before = original.read_bytes()
+            saved = [{"path": str(original), "bytes": len(before), "width": 3840, "height": 2160}]
+            with mock.patch.object(Image.Image, "save", side_effect=PermissionError("read-only")):
+                warnings = client_module.prepare_display(saved)
+            self.assertTrue(warnings)
+            self.assertEqual(saved[0]["display_path"], str(original))
+            self.assertEqual(original.read_bytes(), before)
 
     def test_gemini_edit_sends_both_chat_reference_shapes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:

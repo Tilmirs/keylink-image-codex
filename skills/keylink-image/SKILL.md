@@ -48,7 +48,19 @@ The latest successful image is stored under `.keylink-image/threads/<thread-id>/
 
 ## Return the result
 
-- Display each saved image using its absolute path.
+- Display each image using the returned `display_markdown` and include its `original_markdown` link. Paths use forward slashes and angle brackets for Windows/space compatibility.
+- Large images get a separate JPEG display preview when Pillow is available. This preview is only for inspection/display; the original file and its actual dimensions remain the deliverable and the reference for subsequent edits. Never pass the preview as the next reference image.
+- If `view_image` fails with `invalid base64`, `Invalid padding`, or an oversized payload, use `display_path`. A preview error does not mean generation failed; still return the saved original link, without sending a new image request.
 - Include the model, endpoint actually used, requested size, and detected pixel size when available.
 - If both automatic endpoints fail, summarize both errors and ask whether to switch models. Do not switch models before the user agrees.
 - If the user explicitly fixed an endpoint, report that endpoint's failure without trying another one.
+
+## Recover a missing display
+
+When the user reports success without an image, or resumes an interrupted generation, run `last` in the original workspace with the original `--thread-id` first. It reads the saved result and creates a small preview locally; no credentials, model selection, or network requests are needed. Compare `saved_at` with the request time so an older result is not mistaken for a still-running request. If the generation session is still active, poll that same session for its final result.
+
+```powershell
+& "<skill-dir>\scripts\keylink-image.ps1" last --thread-id "<original-task-id>"
+```
+
+Use `--preview-dir <writable-directory>` when recovering from a workspace that cannot be written. Pillow is optional for generation; it is needed to create display previews. If unavailable, return the original image link and explain the preview limitation.

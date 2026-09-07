@@ -36,6 +36,8 @@ Do not claim a lower-resolution result is 2K or 4K. Do not retry a confirmed hig
 
 ## Response formats
 
+Saving an image and displaying it are separate stages. Codex's image viewer may fail to load a large 4K PNG with an `invalid base64`/`Invalid padding` error even when the file is intact. The client generates a small JPEG display copy with optional Pillow and always preserves the original for delivery and later edits. Preview failures do not trigger endpoint fallback or another generation. `last` recovers saved results without API calls, including results saved by older client versions.
+
 The client accepts image URLs, `data:image/...;base64,...` values, common Base64 fields such as `b64_json`, and image values inside Chat message content or message image arrays. URL downloads inherit authentication only when the image URL uses the same host as the configured API root, preventing credentials from being sent to unrelated hosts.
 
 If a configured system HTTP proxy fails to connect to a returned image URL, retry downloading that same image directly once before treating the endpoint as failed. HTTP error responses are not retried this way. This download recovery does not issue another generation request or alter model, prompt, size, or endpoint selection.
