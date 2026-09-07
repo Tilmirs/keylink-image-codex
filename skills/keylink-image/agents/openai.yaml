@@ -1,0 +1,7 @@
+interface:
+  display_name: "Keylink Image"
+  short_description: "Generate and edit images through Keylink APIs"
+  brand_color: "#0F766E"
+  default_prompt: "Use $keylink-image to generate or edit an image through Keylink."
+policy:
+  allow_implicit_invocation: true
