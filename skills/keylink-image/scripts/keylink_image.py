@@ -589,7 +589,8 @@ def resolve_thread_id(explicit: str | None) -> str:
     if not raw:
         raw = os.environ.get("CODEX_THREAD_ID") or os.environ.get("CODEX_SESSION_ID")
     if not raw:
-        raw = "workspace-" + hashlib.sha256(str(Path.cwd()).encode()).hexdigest()[:16]
+        workspace = os.path.normcase(str(Path.cwd().resolve()))
+        raw = "workspace-" + hashlib.sha256(workspace.encode()).hexdigest()[:16]
     safe = re.sub(r"[^A-Za-z0-9._-]", "-", raw).strip("-.")
     return safe or "default"
 

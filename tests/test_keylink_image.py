@@ -264,7 +264,7 @@ class KeylinkImageTests(unittest.TestCase):
             self.assertLess(Path(item["preview_path"]).stat().st_size, 1024 * 1024)
             self.assertEqual(original.read_bytes(), before)
             self.assertEqual(state_path.read_bytes(), state_before)
-            self.assertEqual(client_module.load_last_image(state_dir), original)
+            self.assertEqual(client_module.load_last_image(state_dir), original.resolve())
             self.assertEqual(server.requests, [])
             original.unlink()
             failed, error = self.run_client(workspace, server, "last")
@@ -316,7 +316,7 @@ class KeylinkImageTests(unittest.TestCase):
             with mock.patch.object(Image.Image, "save", side_effect=PermissionError("read-only")):
                 warnings = client_module.prepare_display(saved)
             self.assertTrue(warnings)
-            self.assertEqual(saved[0]["display_path"], str(original))
+            self.assertEqual(saved[0]["display_path"], str(original.resolve()))
             self.assertEqual(original.read_bytes(), before)
 
     def test_gemini_edit_sends_both_chat_reference_shapes(self) -> None:
@@ -750,6 +750,20 @@ class KeylinkImageTests(unittest.TestCase):
             body = json.loads(server.requests[0]["body"])
             self.assertEqual(body["prompt"], prompt)
             self.assertEqual(body["size"], "1024x1024")
+
+    @unittest.skipIf(os.name == "nt", "POSIX launcher integration")
+    def test_workspace_fallback_id_is_stable_through_directory_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary) / "real-workspace"
+            workspace.mkdir()
+            alias = Path(temporary) / "workspace-alias"
+            alias.symlink_to(workspace, target_is_directory=True)
+            with mock.patch.dict(os.environ, {}, clear=True):
+                with mock.patch.object(client_module.Path, "cwd", return_value=workspace):
+                    original_id = client_module.resolve_thread_id(None)
+                with mock.patch.object(client_module.Path, "cwd", return_value=alias):
+                    alias_id = client_module.resolve_thread_id(None)
+            self.assertEqual(original_id, alias_id)
 
     @unittest.skipIf(os.name == "nt", "POSIX launcher integration")
     def test_shell_launcher_preserves_prompt_and_paths_with_spaces(self) -> None:
