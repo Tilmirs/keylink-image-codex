@@ -32,6 +32,9 @@ PNG_BYTES = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
 )
 PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
+GPT_IMAGE_25_MODELS = (
+    "gpt-image-2.5", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare",
+)
 
 
 class TestServer(ThreadingHTTPServer):
@@ -503,6 +506,100 @@ class KeylinkImageTests(unittest.TestCase):
             self.assertTrue(payload["selection_token"])
             self.assertTrue(payload["selection_required"])
             self.assertIn("wait patiently", payload["four_k_notice"])
+
+    def test_gpt_image_25_catalog_keeps_distinct_variants_and_their_sizes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            server.routes[("GET", "/v1/models")] = json_response({"data": [
+                {"id": "gpt-image-2.5", "capabilities": {"sizes": ["1024x1024", "3840x2160"]}},
+                {"id": "gpt-image-2.5-sunburst", "capabilities": {"sizes": ["1536x1024"]}},
+                {"id": "gpt-image-2.5-flare"},
+                {"id": "gpt-image-future-variant"},
+                {"id": "text-model"},
+            ]})
+            completed, result = self.run_client(Path(temporary), server, "models")
+            self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            found = {entry["id"]: entry["published_sizes"] for entry in result["image_models"]}
+            self.assertEqual(found, {
+                "gpt-image-2.5": ["1024x1024", "3840x2160"],
+                "gpt-image-2.5-sunburst": ["1536x1024"],
+                "gpt-image-2.5-flare": [],
+                "gpt-image-future-variant": [],
+            })
+            self.assertEqual(result["preferred_sizes"], ["1024x1024", "1536x1024", "1024x1536"])
+            self.assertEqual([r["path"] for r in server.requests], ["/v1/models"])
+
+    def test_gpt_image_25_generation_and_continued_edit_preserve_variant(self) -> None:
+        for model in GPT_IMAGE_25_MODELS:
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as temporary, running_server() as server:
+                workspace = Path(temporary)
+                server.routes[("POST", "/v1/images/generations")] = json_response(
+                    {"data": [{"b64_json": PNG_B64}]}
+                )
+                generated, first = self.run_client(
+                    workspace, server, "run", "--prompt", "a lighthouse", "--model", model,
+                    "--aspect", "landscape",
+                )
+                self.assertEqual(generated.returncode, 0, generated.stdout + generated.stderr)
+                self.assertEqual([r["path"] for r in server.requests], ["/v1/images/generations"])
+                generation_body = json.loads(server.requests[0]["body"])
+                self.assertEqual(generation_body["model"], model)
+                self.assertEqual(generation_body["size"], "1536x1024")
+                self.assertEqual(first["model"], model)
+                original = Path(first["images"][0]["path"])
+                self.assertEqual(original.read_bytes(), PNG_BYTES)
+
+                server.routes[("POST", "/v1/images/edits")] = json_response(
+                    {"error": "Images edit unavailable"}, status=400
+                )
+                server.routes[("POST", "/v1/chat/completions")] = json_response(
+                    {"choices": [{"message": {"images": [{"b64_json": PNG_B64}]}}]}
+                )
+                prompt = "change only the sky to sunset"
+                completed, edited = self.run_client(
+                    workspace, server, "run", "--prompt", prompt, "--model", model,
+                    "--use-last", "--size", "3840x2160", "--confirm-high-res",
+                )
+                self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+                self.assertEqual([r["path"] for r in server.requests],
+                                 ["/v1/images/edits", "/v1/chat/completions"])
+                multipart = server.requests[0]["body"]
+                self.assertIn(f'name="model"\r\n\r\n{model}\r\n'.encode(), multipart)
+                self.assertIn(b'name="size"\r\n\r\n3840x2160\r\n', multipart)
+                self.assertIn(b'name="image"; filename=', multipart)
+                self.assertIn(PNG_BYTES, multipart)
+                chat = json.loads(server.requests[1]["body"])
+                self.assertEqual(chat["model"], model)
+                self.assertEqual(chat["size"], "3840x2160")
+                content = chat["messages"][0]["content"]
+                self.assertEqual([item["text"] for item in content if item["type"] == "text"], [prompt])
+                data_url = f"data:image/png;base64,{PNG_B64}"
+                self.assertEqual([item["image_url"]["url"] for item in content if item["type"] == "image_url"], [data_url])
+                self.assertEqual(chat["images"], [{"image_url": data_url}])
+                self.assertEqual(edited["model"], model)
+                self.assertEqual(edited["references"], [str(original)])
+                self.assertEqual(edited["endpoint"], "chat")
+                self.assertEqual(edited["requested_size"], "3840x2160")
+                self.assertTrue(Path(edited["images"][0]["path"]).is_file())
+                self.assertTrue(any("not guaranteed" in warning for warning in edited["warnings"]))
+                state = json.loads((workspace / ".keylink-image" / "threads" / "test-thread" / "last.json").read_text(encoding="utf-8"))
+                self.assertEqual(state["model"], model)
+
+    def test_gpt_image_25_explicit_chat_failure_does_not_switch_to_images(self) -> None:
+        for model in GPT_IMAGE_25_MODELS:
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as temporary, running_server() as server:
+                server.routes[("POST", "/v1/chat/completions")] = json_response({"choices": []})
+                server.routes[("POST", "/v1/images/generations")] = json_response(
+                    {"data": [{"b64_json": PNG_B64}]}
+                )
+                completed, result = self.run_client(
+                    Path(temporary), server, "run", "--prompt", "a lighthouse", "--model", model,
+                    "--endpoint", "chat",
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertEqual([r["path"] for r in server.requests], ["/v1/chat/completions"])
+                self.assertEqual(json.loads(server.requests[0]["body"])["model"], model)
+                self.assertEqual(result["model"], model)
+                self.assertFalse(result["ask_user_to_switch_model"])
 
     def test_run_requires_model_discovery_selection_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:

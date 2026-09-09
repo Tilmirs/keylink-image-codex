@@ -28,6 +28,9 @@ from typing import Any, Iterable
 DEFAULT_BASE_URL = "https://keylinkclub.com"
 DEFAULT_MODEL_PRIORITY = (
     "gpt-image-2",
+    "gpt-image-2.5",
+    "gpt-image-2.5-sunburst",
+    "gpt-image-2.5-flare",
     "gemini-3-pro-image",
     "gemini-3.1-flash-image",
 )

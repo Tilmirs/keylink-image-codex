@@ -13,14 +13,14 @@ This is a standalone Codex skill. Resolve paths relative to the directory contai
 2. When the user says the result is unsatisfactory, visually wrong, or asks to change the image just produced, edit the latest successful image for this Codex task. Pass only the requested changes as `--prompt` and add `--use-last`.
 3. When it is unclear whether the user wants a new image or an edit, ask which operation they intend. After they choose editing, reuse the latest image without asking them to upload it again.
 4. Pass explicit uploads with one `--image <path>` per image. Uploaded images take priority over `--use-last` inside the client.
-5. Preserve the user's model ID exactly. Model IDs are pass-through values.
+5. Preserve the user's model ID exactly. Model IDs are pass-through values, including `gpt-image-2.5`, `gpt-image-2.5-sunburst`, and `gpt-image-2.5-flare`. Treat variants as separate catalog choices; never strip their suffixes or substitute the base model during generation, editing, or fallback.
 
 ## Choose model, size, and endpoint
 
 - Before every generation or edit, run `models`. It calls `GET /v1/models`, saves a one-use selection token for the current Codex task, and reports server-published sizes.
 - Show the returned `image_models` to the user and wait for the user to choose one. Never choose a model automatically, silently reuse the previous model, or start an image request in the same turn as model discovery unless the user already replied with a choice from that exact discovery result.
 - Pass the chosen model unchanged with `--model` and pass the returned token with `--selection-token`. The client rejects missing, stale, reused, wrong-task, wrong-host, and unlisted model selections. A new generation or edit requires a fresh `models` call and a fresh user choice.
-- Prefer `1024x1024`, `1536x1024`, or `1024x1536` for `gpt-image-2` and supported Gemini image models. Choose among them from the requested aspect ratio. Do not assume `2048x2048` when the catalog does not publish it.
+- Prefer `1024x1024`, `1536x1024`, or `1024x1536` for `gpt-image-2`, the `gpt-image-2.5` family (including `sunburst` and `flare`), and supported Gemini image models. Choose among them from the requested aspect ratio. Read sizes for the exact selected model ID; do not inherit published sizes from its base model or another variant. Do not assume `2048x2048` when the catalog does not publish it.
 - Treat "更高分辨率", "高分辨率", "高清", "超高清", "2K", "4K", "UHD", or an explicitly larger pixel size as high-resolution intent. Show the published sizes plus relevant experimental candidates such as `2560x1440` and `3840x2160`, then wait for user confirmation before running the image request.
 - Before starting a confirmed `3840x2160` request, tell the user that 4K generation can take several minutes and ask them to wait patiently. Continue waiting on the same request and do not submit duplicates while it is still running.
 - After confirmation, pass `--confirm-high-res`. Never locally upscale, silently downgrade to 1K, or change the model. A Chat success may not honor the requested pixels; state that limitation and report detected dimensions when available.

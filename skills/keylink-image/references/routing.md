@@ -9,10 +9,13 @@ Send requests directly to `https://keylinkclub.com`, unless the user explicitly 
 | Model family | Text generation | Reference-image edit |
 | --- | --- | --- |
 | `gpt-image-2` and `gpt-image-*` | Images Generations, then Chat | Images Edits, then Chat |
+| `gpt-image-2.5`, `gpt-image-2.5-sunburst`, `gpt-image-2.5-flare` | Images Generations, then Chat | Images Edits, then Chat |
 | `gemini-3-pro-image`, `gemini-3.1-flash-image`, and Gemini image IDs | Images Generations, then Chat | Images Edits, then Chat |
 | Other pass-through model IDs | Images, then Chat | Images Edits, then Chat |
 
 Automatic fallback occurs for HTTP errors, successful responses with no image, and image download or decoding failures. Both attempts use the same model ID, prompt, size, and references. Explicit `images`, `chat`, and custom endpoint modes make exactly one attempt.
+
+The `gpt-image-2.5` variants are distinct pass-through IDs, not aliases for `gpt-image-2.5` or `gpt-image-2`. Display only models returned by the current catalog, preserve variant suffixes in every request and saved result, and read published sizes from each variant's own catalog entry. New model names alone do not imply new size support or different API fields.
 
 Images generation uses JSON with `POST /v1/images/generations`. Images editing uses multipart form data with repeated `image` file fields at `POST /v1/images/edits`.
 

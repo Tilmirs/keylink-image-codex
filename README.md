@@ -7,10 +7,15 @@
 | 模型 ID | 能力 | 自动调用顺序 |
 | --- | --- | --- |
 | `gpt-image-2` | 文生图、参考图编辑、上一张图继续修改 | Images → Chat |
+| `gpt-image-2.5` | 文生图、参考图编辑、上一张图继续修改 | Images → Chat |
+| `gpt-image-2.5-sunburst` | 文生图、参考图编辑、上一张图继续修改 | Images → Chat |
+| `gpt-image-2.5-flare` | 文生图、参考图编辑、上一张图继续修改 | Images → Chat |
 | `gemini-3-pro-image` | 文生图、参考图编辑、上一张图继续修改 | Images → Chat |
 | `gemini-3.1-flash-image` | 文生图、参考图编辑、上一张图继续修改 | Images → Chat |
 
 具体可用性、尺寸和编辑能力取决于当前凭据及 Keylink 渠道，以 `GET /v1/models` 返回和实际请求结果为准。模型 ID 原样透传，服务端新增模型通常无需修改 Skill；自动识别支持图片名称或图片能力元数据的条目。新增请求字段、响应格式或识别规则时才需要适配代码。
+
+`gpt-image-2.5-sunburst` 和 `gpt-image-2.5-flare` 是独立可选的变体 ID。选择后，文生图、参考图编辑、连续修改和端点重试都保留完整 ID，不替换为 `gpt-image-2.5` 或 `gpt-image-2`。各变体的尺寸信息分别读取；未公布时仍使用保守尺寸，高分辨率请求继续先确认。
 
 ## 功能
 
@@ -95,7 +100,7 @@ export HTTP_PROXY="$HTTPS_PROXY"
 | 文生图 | `POST /v1/images/generations`，JSON `prompt` | `POST /v1/chat/completions` |
 | 上传参考图 / 继续修改 | `POST /v1/images/edits`，multipart `image` 文件字段和 `prompt` | `POST /v1/chat/completions`，同时发送 `messages[].content[].image_url` 和 `images[].image_url` |
 
-以上顺序对三个内置识别模型及其他透传模型统一适用。用户明确指定 `--endpoint images`、`--endpoint chat` 或自定义端点时只调用指定端点，不自动切换。
+以上顺序对表中全部模型、变体及其他透传模型统一适用。用户明确指定 `--endpoint images`、`--endpoint chat` 或自定义端点时只调用指定端点，不自动切换。
 
 ### 高分辨率与等待
 
