@@ -7,9 +7,11 @@ import argparse
 import base64
 import binascii
 import contextlib
+import csv
 import datetime as dt
 import errno
 import hashlib
+import http.client
 import json
 import mimetypes
 import os
@@ -18,12 +20,14 @@ import sqlite3
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -411,14 +415,18 @@ class HttpClient:
                 content_type = response.headers.get_content_type()
                 return response.read(), content_type
         except urllib.error.HTTPError as error:
-            raw = error.read()
-            detail = safe_response_text(raw) or error.reason
+            try:
+                detail = safe_response_text(error.read()) or error.reason
+            except (OSError, http.client.HTTPException) as read_error:
+                detail = f"{error.reason} (could not read error body: {read_error})"
+            finally:
+                error.close()
             raise ClientError(
                 f"HTTP {error.code} for {request.full_url}: {detail}"
             ) from error
         except urllib.error.URLError as error:
             raise ClientError(f"Request failed for {request.full_url}: {error.reason}") from error
-        except OSError as error:
+        except (OSError, http.client.HTTPException) as error:
             raise ClientError(f"Request failed for {request.full_url}: {error}") from error
 
 
@@ -1151,6 +1159,25 @@ def job_directory(state_dir: Path, job_id: str) -> Path:
 def process_is_running(pid: Any) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates processes on Windows instead of probing them.
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE only
+        if not handle:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER: no such PID
+        try:
+            return kernel32.WaitForSingleObject(handle, 0) != 0
+        finally:
+            kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -1169,15 +1196,51 @@ def create_windows_worker_task(command: list[str], cwd: str, job_id: str) -> str
     if not schtasks.is_file():
         raise ClientError("Windows task scheduler is unavailable; the high-resolution job was not started.")
     task_name = r"\KeylinkImage-" + job_id
-    command_line = subprocess.list2cmdline(command)
-    start_time = time.strftime("%H:%M", time.localtime(time.time() + 60))
-    create = subprocess.run(
-        [str(schtasks), "/Create", "/TN", task_name, "/SC", "ONCE",
-         "/ST", start_time, "/TR", command_line, "/F"],
+    identity = subprocess.run(
+        [str(schtasks.with_name("whoami.exe")), "/USER", "/FO", "CSV", "/NH"],
         cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         stderr=subprocess.PIPE, text=True, encoding="mbcs", errors="replace",
         check=False,
     )
+    rows = list(csv.reader(identity.stdout.splitlines()))
+    if identity.returncode != 0 or not rows or len(rows[0]) != 2:
+        raise ClientError("Could not identify the current Windows user for the image job.")
+    user_sid = rows[0][1]
+    if not re.fullmatch(r"S-\d+(?:-\d+)+", user_sid):
+        raise ClientError("Windows returned an invalid user SID for the image job.")
+
+    # XML separates executable/arguments without /TR's 261-character limit.
+    # No triggers: only /Run starts the job, so it cannot repeat a paid request.
+    task = ET.Element("Task", version="1.2", xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task")
+    principal = ET.SubElement(ET.SubElement(task, "Principals"), "Principal", id="Author")
+    ET.SubElement(principal, "UserId").text = user_sid
+    ET.SubElement(principal, "LogonType").text = "InteractiveToken"
+    ET.SubElement(principal, "RunLevel").text = "LeastPrivilege"
+    settings = ET.SubElement(task, "Settings")
+    for name, value in (
+        ("MultipleInstancesPolicy", "IgnoreNew"),
+        ("DisallowStartIfOnBatteries", "false"),
+        ("StopIfGoingOnBatteries", "false"),
+        ("AllowStartOnDemand", "true"),
+        ("Enabled", "true"),
+        ("ExecutionTimeLimit", "PT0S"),
+    ):
+        ET.SubElement(settings, name).text = value
+    action = ET.SubElement(ET.SubElement(task, "Actions", Context="Author"), "Exec")
+    executable = Path(command[0])
+    windowless = executable.with_name("pythonw.exe")
+    ET.SubElement(action, "Command").text = str(windowless if windowless.is_file() else executable)
+    ET.SubElement(action, "Arguments").text = subprocess.list2cmdline(command[1:])
+    ET.SubElement(action, "WorkingDirectory").text = cwd
+    with tempfile.TemporaryDirectory(prefix="keylink-task-") as temporary:
+        definition = Path(temporary) / "worker.xml"
+        ET.ElementTree(task).write(definition, encoding="utf-16", xml_declaration=True)
+        create = subprocess.run(
+            [str(schtasks), "/Create", "/TN", task_name, "/XML", str(definition), "/F"],
+            cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="mbcs", errors="replace",
+            check=False,
+        )
     if create.returncode != 0:
         detail = (create.stderr or create.stdout).strip()
         raise ClientError(
@@ -1378,8 +1441,7 @@ def command_worker(args: argparse.Namespace) -> int:
         with temporary.open("w", encoding="utf-8") as output:
             emit({"status": "error", "error": f"Background worker failed: {error}"}, stream=output)
         exit_code = 1
-    temporary.replace(directory / "result.json")
-    payload = read_json_file(directory / "result.json")
+    payload = read_json_file(temporary)
     delete_windows_task(job.get("task_name"))
     job.update(
         status="succeeded" if exit_code == 0 and isinstance(payload, dict)
@@ -1388,6 +1450,8 @@ def command_worker(args: argparse.Namespace) -> int:
         finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
     )
     write_json_file(directory / "job.json", job)
+    # Publishing the result is the final step; readers can then use it immediately.
+    temporary.replace(directory / "result.json")
     return 0
 
 
@@ -1404,10 +1468,13 @@ def command_status(args: argparse.Namespace) -> int:
     payload = read_json_file(directory / "result.json")
     if isinstance(payload, dict):
         result = dict(payload)
-        result.update(background=True, job_id=job_id, job_status=job.get("status"))
+        result.update(background=True, job_id=job_id,
+                      job_status="succeeded" if result.get("status") == "ok" else "failed")
         emit(result)
         return 0 if result.get("status") == "ok" else 1
     status = str(job.get("status", "unknown"))
+    if status in {"succeeded", "failed"} and "exit_code" in job and process_is_running(job.get("pid")):
+        status = "running"  # The worker is publishing its final result.
     if status in {"starting", "running"} and job.get("pid") and not process_is_running(job.get("pid")):
         status = "failed"
         job.update(

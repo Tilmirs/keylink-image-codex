@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import http.client
 import io
 import json
 import os
@@ -15,6 +16,7 @@ import threading
 import time
 import unittest
 import urllib.error
+import xml.etree.ElementTree as ET
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -113,6 +115,7 @@ class KeylinkImageTests(unittest.TestCase):
         *args: str,
         thread_id: str = "test-thread",
         auto_select: bool = True,
+        force_scheduled_task: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any]]:
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
@@ -151,10 +154,23 @@ class KeylinkImageTests(unittest.TestCase):
                 ["--selection-token", selection["selection_token"]]
             )
             server.requests.clear()
+        entrypoint = [str(CLIENT)]
+        if force_scheduled_task:
+            entrypoint = ["-c", "\n".join([
+                "import runpy, subprocess, sys",
+                "popen = subprocess.Popen",
+                "def deny_breakaway(*args, **kwargs):",
+                "    if kwargs.get('creationflags', 0) & 0x01000000:",
+                "        raise PermissionError('test: breakaway denied')",
+                "    return popen(*args, **kwargs)",
+                "subprocess.Popen = deny_breakaway",
+                "sys.argv = sys.argv[1:]",
+                "runpy.run_path(sys.argv[0], run_name='__main__')",
+            ]), str(CLIENT)]
         completed = subprocess.run(
             [
                 sys.executable,
-                str(CLIENT),
+                *entrypoint,
                 *effective_args,
                 *(["--base-url", base_url] if args[0] in {"models", "run", "start"} else []),
             ],
@@ -165,7 +181,11 @@ class KeylinkImageTests(unittest.TestCase):
             timeout=15,
             check=False,
         )
-        payload = json.loads(completed.stdout)
+        try:
+            payload = json.loads(completed.stdout)
+        except json.JSONDecodeError:
+            self.fail(f"Client exited {completed.returncode} without JSON: "
+                      f"{completed.stdout}\n{completed.stderr}")
         return completed, payload
 
     def test_gpt_image_falls_back_from_images_no_image_to_chat(self) -> None:
@@ -603,8 +623,16 @@ class KeylinkImageTests(unittest.TestCase):
                 self.assertFalse(result["ask_user_to_switch_model"])
 
     def test_background_job_saves_once_after_launcher_exits(self) -> None:
+        self.check_background_job_saves_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows scheduled-task fallback")
+    def test_scheduled_job_saves_once_after_launcher_exits(self) -> None:
+        self.check_background_job_saves_once(force_scheduled_task=True)
+
+    def check_background_job_saves_once(self, force_scheduled_task: bool = False) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:
-            workspace = Path(temporary)
+            workspace = Path(temporary) / "image workspace with spaces & \u56fe\u7247"
+            workspace.mkdir()
             request_received = threading.Event()
             release_response = threading.Event()
 
@@ -619,10 +647,13 @@ class KeylinkImageTests(unittest.TestCase):
                 workspace, server, "start", "--prompt", "a 4K black hole",
                 "--model", "gpt-image-2.5", "--size", "3840x2160",
                 "--confirm-high-res",
+                force_scheduled_task=force_scheduled_task,
             )
             self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
             self.assertEqual(job["status"], "started")
             self.assertTrue(job["background"])
+            if force_scheduled_task:
+                self.assertEqual(job["launch_mode"], "scheduled-task")
             self.assertTrue(request_received.wait(5), "background request did not start")
 
             running, running_status = self.run_client(
@@ -672,6 +703,66 @@ class KeylinkImageTests(unittest.TestCase):
             self.assertEqual(Path(recovered_result["images"][0]["path"]), output)
             self.assertEqual([request["path"] for request in server.requests],
                              ["/v1/images/generations"])
+
+    def test_process_probe_does_not_stop_worker(self) -> None:
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.assertTrue(client_module.process_is_running(process.pid))
+            self.assertIsNone(process.poll())
+            process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0)
+            self.assertFalse(client_module.process_is_running(process.pid))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+            process.communicate(timeout=5)
+
+    def test_http_error_with_broken_body_remains_endpoint_failure(self) -> None:
+        for read_error in (ConnectionResetError("connection reset"), http.client.IncompleteRead(b"")):
+            with self.subTest(error=type(read_error).__name__):
+                request = client_module.urllib.request.Request("http://127.0.0.1/v1/images/edits")
+                error = urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, io.BytesIO())
+                client = client_module.HttpClient("http://127.0.0.1", None, 5)
+                client.opener = mock.Mock()
+                client.opener.open.side_effect = error
+                with mock.patch.object(error, "read", side_effect=read_error):
+                    with self.assertRaisesRegex(client_module.ClientError, "HTTP 404.*could not read error body"):
+                        client._open(request)
+
+    @unittest.skipUnless(os.name == "nt", "Windows scheduled-task fallback")
+    def test_scheduled_task_supports_long_arguments_without_timer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            command = [sys.executable, "-X", "utf8", str(CLIENT), "_worker", "--job-dir",
+                       str(Path(temporary) / ("long image path & \u56fe\u7247 " * 12))]
+            self.assertGreater(len(subprocess.list2cmdline(command)), 261)
+            definition_paths: list[Path] = []
+
+            def register(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                if Path(argv[0]).name == "whoami.exe":
+                    return subprocess.CompletedProcess(argv, 0, '"DOMAIN\\user","S-1-5-21-123-1001"', "")
+                self.assertIn("/XML", argv)
+                self.assertNotIn("/TR", argv)
+                definition = Path(argv[argv.index("/XML") + 1])
+                definition_paths.append(definition)
+                root = ET.parse(definition).getroot()
+                ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+                self.assertIsNone(root.find("t:Triggers", ns))
+                self.assertEqual(root.findtext("t:Actions/t:Exec/t:Arguments", namespaces=ns),
+                                 subprocess.list2cmdline(command[1:]))
+                self.assertEqual(root.findtext("t:Actions/t:Exec/t:WorkingDirectory", namespaces=ns),
+                                 temporary)
+                self.assertEqual(root.findtext("t:Principals/t:Principal/t:UserId", namespaces=ns),
+                                 "S-1-5-21-123-1001")
+                return subprocess.CompletedProcess(argv, 0, "created", "")
+
+            with mock.patch.object(client_module.subprocess, "run", side_effect=register):
+                task = client_module.create_windows_worker_task(command, temporary, "test-long-path")
+            self.assertEqual(task, r"\KeylinkImage-test-long-path")
+            self.assertTrue(definition_paths)
+            self.assertFalse(definition_paths[0].exists())
 
     def test_background_start_rejects_high_resolution_before_spawning(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:
