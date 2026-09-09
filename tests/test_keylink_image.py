@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from unittest import mock
@@ -121,7 +122,7 @@ class KeylinkImageTests(unittest.TestCase):
         env.pop("KEYLINK_IMAGE_STATE_DIR", None)
         base_url = f"http://127.0.0.1:{server.server_address[1]}"
         effective_args = list(args)
-        if effective_args and effective_args[0] == "run" and auto_select:
+        if effective_args and effective_args[0] in {"run", "start"} and auto_select:
             model_index = effective_args.index("--model") + 1
             selected_model = effective_args[model_index]
             server.routes[("GET", "/v1/models")] = json_response(
@@ -155,7 +156,7 @@ class KeylinkImageTests(unittest.TestCase):
                 sys.executable,
                 str(CLIENT),
                 *effective_args,
-                *([] if args[0] == "last" else ["--base-url", base_url]),
+                *(["--base-url", base_url] if args[0] in {"models", "run", "start"} else []),
             ],
             cwd=workspace,
             env=env,
@@ -600,6 +601,96 @@ class KeylinkImageTests(unittest.TestCase):
                 self.assertEqual(json.loads(server.requests[0]["body"])["model"], model)
                 self.assertEqual(result["model"], model)
                 self.assertFalse(result["ask_user_to_switch_model"])
+
+    def test_background_job_saves_once_after_launcher_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            workspace = Path(temporary)
+            request_received = threading.Event()
+            release_response = threading.Event()
+
+            def delayed_image(_request: dict[str, Any]) -> tuple[int, str, Any]:
+                request_received.set()
+                if not release_response.wait(10):
+                    return json_response({"error": "test timeout"}, status=504)
+                return json_response({"data": [{"b64_json": PNG_B64}]})
+
+            server.routes[("POST", "/v1/images/generations")] = delayed_image
+            started, job = self.run_client(
+                workspace, server, "start", "--prompt", "a 4K black hole",
+                "--model", "gpt-image-2.5", "--size", "3840x2160",
+                "--confirm-high-res",
+            )
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            self.assertEqual(job["status"], "started")
+            self.assertTrue(job["background"])
+            self.assertTrue(request_received.wait(5), "background request did not start")
+
+            running, running_status = self.run_client(
+                workspace, server, "status", "--job-id", job["job_id"],
+                auto_select=False,
+            )
+            self.assertEqual(running.returncode, 0, running.stdout + running.stderr)
+            self.assertEqual(running_status["status"], "running")
+            self.assertIn("do not resubmit", running_status["message"])
+
+            release_response.set()
+            deadline = time.monotonic() + 10
+            while True:
+                completed, result = self.run_client(
+                    workspace, server, "status", "--job-id", job["job_id"],
+                    auto_select=False,
+                )
+                if result["status"] != "running":
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail("background image job did not finish")
+                time.sleep(0.1)
+            job_dir = (workspace / ".keylink-image" / "threads" / "test-thread"
+                       / "jobs" / job["job_id"])
+            diagnostic = "\n".join(
+                f"{path.name}: {path.read_text(encoding='utf-8', errors='replace')}"
+                for path in job_dir.glob("*") if path.is_file()
+            )
+            self.assertEqual(
+                completed.returncode, 0,
+                completed.stdout + completed.stderr + "\n" + diagnostic,
+            )
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["job_status"], "succeeded")
+            self.assertEqual(result["model"], "gpt-image-2.5")
+            self.assertEqual(result["requested_size"], "3840x2160")
+            self.assertEqual([request["path"] for request in server.requests],
+                             ["/v1/images/generations"])
+            output = Path(result["images"][0]["path"])
+            self.assertTrue(output.is_file())
+            self.assertEqual(output.read_bytes(), PNG_BYTES)
+
+            recovered, recovered_result = self.run_client(
+                workspace, server, "last", auto_select=False,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+            self.assertEqual(Path(recovered_result["images"][0]["path"]), output)
+            self.assertEqual([request["path"] for request in server.requests],
+                             ["/v1/images/generations"])
+
+    def test_background_start_rejects_high_resolution_before_spawning(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            completed, result = self.run_client(
+                Path(temporary), server, "start", "--prompt", "a 4K black hole",
+                "--model", "gpt-image-2.5", "--size", "3840x2160",
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("high-resolution intent", result["error"])
+            self.assertEqual(server.requests, [])
+
+    def test_background_status_without_job_does_not_make_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, running_server() as server:
+            completed, result = self.run_client(
+                Path(temporary), server, "status", auto_select=False,
+            )
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("No background image job", result["error"])
+            self.assertEqual(server.requests, [])
 
     def test_run_requires_model_discovery_selection_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:

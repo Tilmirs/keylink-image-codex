@@ -22,7 +22,7 @@ This is a standalone Codex skill. Resolve paths relative to the directory contai
 - Pass the chosen model unchanged with `--model` and pass the returned token with `--selection-token`. The client rejects missing, stale, reused, wrong-task, wrong-host, and unlisted model selections. A new generation or edit requires a fresh `models` call and a fresh user choice.
 - Prefer `1024x1024`, `1536x1024`, or `1024x1536` for `gpt-image-2`, the `gpt-image-2.5` family (including `sunburst` and `flare`), and supported Gemini image models. Choose among them from the requested aspect ratio. Read sizes for the exact selected model ID; do not inherit published sizes from its base model or another variant. Do not assume `2048x2048` when the catalog does not publish it.
 - Treat "更高分辨率", "高分辨率", "高清", "超高清", "2K", "4K", "UHD", or an explicitly larger pixel size as high-resolution intent. Show the published sizes plus relevant experimental candidates such as `2560x1440` and `3840x2160`, then wait for user confirmation before running the image request.
-- Before starting a confirmed `3840x2160` request, tell the user that 4K generation can take several minutes and ask them to wait patiently. Continue waiting on the same request and do not submit duplicates while it is still running.
+- Before starting a confirmed `2560x1440` or `3840x2160` request, tell the user that high-resolution generation can take several minutes and ask them to wait patiently. Use the detached `start` command for these sizes, then poll `status` with the returned job ID. The detached worker receives and saves the response after this Codex turn is interrupted; never submit a second request while the job is running.
 - After confirmation, pass `--confirm-high-res`. Never locally upscale, silently downgrade to 1K, or change the model. A Chat success may not honor the requested pixels; state that limitation and report detected dimensions when available.
 - Use `--endpoint auto` unless the user explicitly fixes `images`, `chat`, or a custom endpoint. Explicit endpoint choices never fall back.
 - For custom endpoints, pass `--endpoint custom --custom-url <url> --custom-kind chat|images`.
@@ -38,6 +38,8 @@ Use JSON output to determine the saved image path and warnings:
 & "<skill-dir>\scripts\keylink-image.ps1" run --prompt "..." --model "gpt-image-2" --selection-token "<token-from-models>" --aspect landscape --endpoint auto
 & "<skill-dir>\scripts\keylink-image.ps1" run --prompt "change only the sky to sunset" --model "gpt-image-2" --selection-token "<fresh-token>" --use-last
 & "<skill-dir>\scripts\keylink-image.ps1" run --prompt "..." --model "gemini-3.1-flash-image" --selection-token "<fresh-token>" --image "C:\path\reference.png"
+& "<skill-dir>\scripts\keylink-image.ps1" start --prompt "..." --model "gpt-image-2.5" --selection-token "<fresh-token>" --size "3840x2160" --confirm-high-res
+& "<skill-dir>\scripts\keylink-image.ps1" status --thread-id "<thread-id>" --job-id "<job-id-from-start>"
 ```
 
 On macOS/Linux, use the same arguments with the shell launcher, keeping paths quoted:
@@ -47,6 +49,8 @@ sh "<skill-dir>/scripts/keylink-image.sh" models
 sh "<skill-dir>/scripts/keylink-image.sh" run --prompt "..." --model "gpt-image-2" --selection-token "<token-from-models>" --aspect landscape
 sh "<skill-dir>/scripts/keylink-image.sh" run --prompt "change only the sky to sunset" --model "gpt-image-2" --selection-token "<fresh-token>" --use-last
 sh "<skill-dir>/scripts/keylink-image.sh" run --prompt "..." --model "gemini-3.1-flash-image" --selection-token "<fresh-token>" --image "/Users/name/Pictures/reference image.png"
+sh "<skill-dir>/scripts/keylink-image.sh" start --prompt "..." --model "gpt-image-2.5" --selection-token "<fresh-token>" --size "3840x2160" --confirm-high-res
+sh "<skill-dir>/scripts/keylink-image.sh" status --thread-id "<thread-id>" --job-id "<job-id-from-start>"
 ```
 
 Send model discovery, generation, and editing requests directly to `https://keylinkclub.com`. Do not route them through Codex or CCSwitch's local API listener. The only address overrides are an explicit `--base-url` or `KEYLINK_BASE_URL`; generic `OPENAI_BASE_URL` and `OPENAI_API_BASE` are ignored. HTTP/SOCKS network proxies are separate from the API base URL; do not use their listening port as `--base-url`.
@@ -55,7 +59,7 @@ Credentials are read without printing them from `KEYLINK_API_KEY`, `OPENAI_API_K
 
 The client uses Python's system/environment HTTP proxy support, including `HTTPS_PROXY`, `HTTP_PROXY`, and `NO_PROXY`. For a VPN, use its HTTP/mixed port or system tunnel; a SOCKS-only URL is not supported by this transport. Do not change the API host to address a network proxy issue.
 
-The latest successful image is stored under `.keylink-image/threads/<thread-id>/` in the current workspace. The client uses `CODEX_THREAD_ID` or `CODEX_SESSION_ID` automatically and records the latest image only after it is saved successfully.
+The latest successful image is stored under `.keylink-image/threads/<thread-id>/` in the current workspace. The client uses `CODEX_THREAD_ID` or `CODEX_SESSION_ID` automatically and records the latest image only after it is saved successfully. Detached jobs are stored under `.keylink-image/threads/<thread-id>/jobs/<job-id>/`; they keep the same workspace and resolve credentials when the worker sends the request.
 
 ## Return the result
 
@@ -68,7 +72,9 @@ The latest successful image is stored under `.keylink-image/threads/<thread-id>/
 
 ## Recover a missing display
 
-When the user reports success without an image, or resumes an interrupted generation, run `last` in the original workspace with the original `--thread-id` first. It reads the saved result and creates a small preview locally; no credentials, model selection, or network requests are needed. Compare `saved_at` with the request time so an older result is not mistaken for a still-running request. If the generation session is still active, poll that same session for its final result.
+When the user reports success without an image, or resumes an interrupted generation, check `status --thread-id <thread-id>` first when a background job may exist. It reads the detached worker's local result and never submits a new request. Use `last` in the original workspace afterward for a completed saved result or for a request made by an older client. Compare `saved_at` and job timestamps with the request time so an older result is not mistaken for a still-running request. If the generation session is still active, poll that same session for its final result.
+
+For a detached job, run `status --job-id <job-id> --thread-id <thread-id>` first. A `running` response means the request already exists and must not be resubmitted. A successful status response contains the saved image; use its `display_markdown` and `original_markdown`. Only run `last` after the status is complete or when the task predates detached jobs.
 
 ```powershell
 & "<skill-dir>\scripts\keylink-image.ps1" last --thread-id "<original-task-id>"

@@ -92,8 +92,9 @@ export HTTP_PROXY="$HTTPS_PROXY"
 2. 等待用户选择模型；每次新生成或编辑都重新查询、选择，选择凭证只能使用一次。
 3. 确定文生图或图生图。用户新上传的参考图优先；“不满意”“把刚才的改成”等纠正意图复用当前任务最近成功的原图，仅发送本次修改要求。意图不明确时先询问。
 4. 确认尺寸。优先 `1024x1024`、`1536x1024`、`1024x1536`；高分辨率先展示服务端尺寸和可尝试候选，用户确认后才请求。
-5. 自动模式下按下表调用。首个端点出现 HTTP 错误、200 但没有图片、图片下载或解码失败时，使用同一模型、提示词、尺寸和参考图尝试 Chat。
-6. 成功后保存本地原图，展示图片并返回原图链接、实际模型、端点和检测到的像素尺寸。两个端点都失败才汇总错误并询问是否换模型。
+5. `2560x1440` 和 `3840x2160` 使用后台作业：启动后返回 job ID，轮询状态直到保存完成。后台作业继续接收响应，即使 Codex 当前任务中断，也不能重复提交。若任务中途被中断，恢复后先执行 `status`，不要重新执行 `run`。
+6. 自动模式下按下表调用。首个端点出现 HTTP 错误、200 但没有图片、图片下载或解码失败时，使用同一模型、提示词、尺寸和参考图尝试 Chat。
+7. 成功后保存本地原图，展示图片并返回原图链接、实际模型、端点和检测到的像素尺寸。两个端点都失败才汇总错误并询问是否换模型。
 
 | 操作 | 第一次请求 | 失败后请求 |
 | --- | --- | --- |
@@ -106,7 +107,7 @@ export HTTP_PROXY="$HTTPS_PROXY"
 
 “高清”“超高清”“更高分辨率”“2K”“4K”“UHD”以及更大的像素尺寸都会进入高分辨率确认流程。16:9 的 2K 级候选为 `2560x1440`，4K 为 `3840x2160`；服务端未公布的候选会注明渠道可能不支持，不假定支持 `2048x2048`。
 
-4K 请求可能耗时数分钟。发送 `3840x2160` 前，Codex 会提示用户耐心等待，并持续等待同一个请求完成，避免重复提交。端点重试不降低尺寸、不更换用户选择的模型，也不本地放大。Chat 不保证遵循像素尺寸；结果会报告实际检测值，不将低分辨率图片称为 4K。
+4K 请求可能耗时数分钟。发送 `3840x2160` 前，Codex 会提示用户耐心等待，并通过后台 job 持续等待同一个请求完成，避免重复提交。端点重试不降低尺寸、不更换用户选择的模型，也不本地放大。Chat 不保证遵循像素尺寸；结果会报告实际检测值，不将低分辨率图片称为 4K。
 
 ### macOS 调用示例
 
@@ -116,13 +117,25 @@ sh "$skill_dir/scripts/keylink-image.sh" models
 sh "$skill_dir/scripts/keylink-image.sh" run \
   --prompt "海边的灯塔" --model "gpt-image-2" \
   --selection-token "<本次查询返回的凭证>" --aspect landscape
+
+# 2K/4K 使用后台作业；start 返回 job_id，随后查询 status
+sh "$skill_dir/scripts/keylink-image.sh" start \
+  --prompt "黑洞" --model "gpt-image-2.5" \
+  --selection-token "<本次查询返回的凭证>" --size "3840x2160" --confirm-high-res
+sh "$skill_dir/scripts/keylink-image.sh" status --job-id "<job_id>" --thread-id "<thread_id>"
 ```
 
 编辑时添加 `--image "/Users/name/Pictures/reference image.png"`，或用 `--use-last` 继续修改当前任务最后一张图。显式固定 Chat 时添加 `--endpoint chat`。在 Codex 外手动调用时，给相关命令使用同一个 `--thread-id`，并保持工作目录一致。
 
 ### 显示成功但没有图片
 
-先在原任务的工作目录恢复保存结果：
+如果是后台作业，先在原任务的工作目录查询保存状态：
+
+```sh
+sh "$skill_dir/scripts/keylink-image.sh" status --job-id "<job_id>" --thread-id "<原任务 ID>"
+```
+
+如果是旧版前台请求，再恢复保存结果：
 
 ```sh
 sh "$skill_dir/scripts/keylink-image.sh" last --thread-id "<原任务 ID>"

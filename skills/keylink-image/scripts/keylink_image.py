@@ -6,7 +6,9 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import contextlib
 import datetime as dt
+import errno
 import hashlib
 import json
 import mimetypes
@@ -14,7 +16,9 @@ import os
 import re
 import sqlite3
 import struct
+import subprocess
 import sys
+import time
 import tomllib
 import urllib.error
 import urllib.parse
@@ -84,7 +88,9 @@ class CCSwitchState:
             self.provider_base_urls = []
 
 
-def emit(payload: dict[str, Any], *, stream: Any = sys.stdout) -> None:
+def emit(payload: dict[str, Any], *, stream: Any = None) -> None:
+    if stream is None:
+        stream = sys.stdout
     json.dump(payload, stream, ensure_ascii=False, indent=2)
     stream.write("\n")
 
@@ -94,6 +100,15 @@ def read_json_file(path: Path) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
+
+
+def write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.parent / f".{path.name}-{uuid.uuid4().hex}.tmp"
+    temporary.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
+    temporary.replace(path)
 
 
 def recursive_lookup(mapping: Any, accepted_keys: set[str]) -> str | None:
@@ -631,21 +646,16 @@ def save_model_selection(
         "issued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "used_at": None,
     }
-    target = state_dir / "model-selection.json"
-    temporary = state_dir / f".model-selection-{uuid.uuid4().hex}.json"
-    temporary.write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(target)
+    write_json_file(state_dir / "model-selection.json", payload)
     return token
 
 
-def consume_model_selection(
+def validate_model_selection(
     state_dir: Path,
     selection_token: str,
     model: str,
     base_url: str,
-) -> None:
+) -> dict[str, Any]:
     target = state_dir / "model-selection.json"
     data = read_json_file(target)
     if not isinstance(data, dict):
@@ -683,13 +693,35 @@ def consume_model_selection(
             f"Model '{model}' was not present in the latest GET /v1/models response. "
             "Run models again and ask the user to choose one of the listed models."
         )
+    return data
 
-    data["used_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
-    temporary = state_dir / f".model-selection-{uuid.uuid4().hex}.json"
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
-    temporary.replace(target)
+
+def consume_model_selection(
+    state_dir: Path,
+    selection_token: str,
+    model: str,
+    base_url: str,
+) -> None:
+    lock_path = state_dir / ".model-selection.lock"
+    lock_fd: int | None = None
+    for _ in range(100):
+        try:
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError:
+            time.sleep(0.05)
+    if lock_fd is None:
+        raise ClientError("The current model selection is already being used by another request.")
+    try:
+        data = validate_model_selection(state_dir, selection_token, model, base_url)
+        data["used_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        write_json_file(state_dir / "model-selection.json", data)
+    finally:
+        os.close(lock_fd)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def validate_reference_paths(paths: Iterable[str]) -> list[Path]:
@@ -720,10 +752,7 @@ def save_last_state(
     }
     if result is not None:
         payload["result"] = result
-    target = state_dir / "last.json"
-    temporary = state_dir / f".last-{uuid.uuid4().hex}.json"
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(target)
+    write_json_file(state_dir / "last.json", payload)
 
 
 def build_chat_payload(
@@ -1062,6 +1091,258 @@ def prepare_display(
     return warnings
 
 
+def validate_size_request(args: argparse.Namespace) -> str:
+    size = choose_size(args.size, args.aspect)
+    high_resolution_intent = has_high_resolution_intent(args.prompt)
+    if high_resolution_intent and not args.confirm_high_res:
+        raise ClientError(
+            "The prompt expresses high-resolution intent. Run models, present the published "
+            "and experimental sizes, obtain user confirmation, and retry with an explicit "
+            "--size plus --confirm-high-res."
+        )
+    if high_resolution_intent and not args.size:
+        raise ClientError(
+            "Confirmed high-resolution intent requires an explicit --size; refusing to send "
+            "a default 1K request."
+        )
+    if size not in CONSERVATIVE_SIZES and not args.confirm_high_res:
+        raise ClientError(
+            f"Size {size} requires user confirmation. Run models, present published and "
+            "experimental sizes, then retry with --confirm-high-res."
+        )
+    return size
+
+
+def run_argv(args: argparse.Namespace, thread_id: str) -> list[str]:
+    result = [
+        "run", "--prompt", args.prompt, "--model", args.model,
+        "--selection-token", args.selection_token, "--mode", args.mode,
+        "--endpoint", args.endpoint, "--aspect", args.aspect,
+        "--thread-id", thread_id, "--timeout", str(args.timeout),
+    ]
+    for path in args.image:
+        result.extend(("--image", path))
+    if args.use_last:
+        result.append("--use-last")
+    if args.confirm_high_res:
+        result.append("--confirm-high-res")
+    for flag, value in (
+        ("--custom-url", args.custom_url), ("--custom-kind", args.custom_kind),
+        ("--size", args.size), ("--base-url", args.base_url),
+        ("--output-dir", args.output_dir),
+    ):
+        if value:
+            result.extend((flag, str(value)))
+    return result
+
+
+def latest_job_id(state_dir: Path) -> str | None:
+    latest = read_json_file(state_dir / "latest-job.json")
+    value = latest.get("job_id") if isinstance(latest, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def job_directory(state_dir: Path, job_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9-]{1,80}", job_id):
+        raise ClientError("Invalid background job ID.")
+    return state_dir / "jobs" / job_id
+
+
+def process_is_running(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as error:
+        return error.errno != errno.ESRCH
+    return True
+
+
+def command_start(args: argparse.Namespace) -> int:
+    base_url, _, _ = discover_base_url(args.base_url)
+    thread_id = resolve_thread_id(args.thread_id)
+    state_dir = thread_state_dir(thread_id)
+    size = validate_size_request(args)
+    validate_model_selection(
+        state_dir, args.selection_token, args.model, base_url
+    )
+    validate_reference_paths(args.image)
+
+    job_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
+    claim = state_dir / "jobs" / ("selection-" + hashlib.sha256(
+        args.selection_token.encode("utf-8")
+    ).hexdigest()[:24] + ".claim")
+    claim.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = claim.read_text(encoding="utf-8", errors="replace").strip()
+    except FileNotFoundError:
+        existing = ""
+    if existing:
+        raise ClientError(
+            "This model selection already started background job "
+            f"{existing}. Check its status instead of submitting again."
+        )
+
+    directory = job_directory(state_dir, job_id)
+    directory.mkdir(parents=True, exist_ok=False)
+    try:
+        claim_fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            os.write(claim_fd, (job_id + "\n").encode("utf-8"))
+        finally:
+            os.close(claim_fd)
+    except FileExistsError:
+        existing = claim.read_text(encoding="utf-8", errors="replace").strip()
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+        raise ClientError(
+            "This model selection already started background job "
+            f"{existing or 'unknown'}. Check its status instead of submitting again."
+        )
+    except Exception:
+        if directory.is_dir():
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        raise
+
+    started_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    request = {
+        "argv": run_argv(args, thread_id),
+        "cwd": str(Path.cwd().resolve()),
+    }
+    job = {
+        "job_id": job_id, "status": "starting", "thread_id": thread_id,
+        "model": args.model, "requested_size": size, "started_at": started_at,
+        "cwd": request["cwd"],
+    }
+    write_json_file(directory / "request.json", request)
+    write_json_file(directory / "job.json", job)
+    write_json_file(state_dir / "latest-job.json", {"job_id": job_id})
+
+    command = [
+        sys.executable, "-X", "utf8", str(Path(__file__).resolve()),
+        "_worker", "--job-dir", str(directory.resolve()),
+    ]
+    popen_kwargs: dict[str, Any] = {
+        "cwd": request["cwd"], "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL,
+        "close_fds": True, "env": os.environ.copy(),
+    }
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = (
+            subprocess.DETACHED_PROCESS
+            | subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW
+            | 0x01000000  # CREATE_BREAKAWAY_FROM_JOB
+        )
+    else:
+        popen_kwargs["start_new_session"] = True
+    try:
+        process = subprocess.Popen(command, **popen_kwargs)
+    except OSError as error:
+        job.update(status="failed", finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                   error=f"Could not start background worker: {error}")
+        write_json_file(directory / "job.json", job)
+        try:
+            claim.unlink()
+        except OSError:
+            pass
+        raise ClientError(job["error"]) from error
+
+    emit({
+        "status": "started", "background": True, "job_id": job_id,
+        "pid": process.pid, "thread_id": thread_id, "model": args.model,
+        "requested_size": size, "started_at": started_at,
+        "status_args": ["status", "--job-id", job_id, "--thread-id", thread_id],
+        "message": "Background image job started. Poll status; do not submit the request again.",
+    })
+    return 0
+
+
+def command_worker(args: argparse.Namespace) -> int:
+    directory = Path(args.job_dir).resolve()
+    request = read_json_file(directory / "request.json")
+    job = read_json_file(directory / "job.json")
+    if not isinstance(request, dict) or not isinstance(job, dict):
+        return 1
+    job.update(status="running", pid=os.getpid(), worker_started_at=dt.datetime.now(dt.timezone.utc).isoformat())
+    write_json_file(directory / "job.json", job)
+    temporary = directory / f".result-{uuid.uuid4().hex}.tmp"
+    exit_code = 1
+    try:
+        argv = request.get("argv")
+        cwd = request.get("cwd")
+        if not isinstance(argv, list) or not all(isinstance(value, str) for value in argv):
+            raise ClientError("Background job request arguments are invalid.")
+        if not isinstance(cwd, str) or not Path(cwd).is_dir():
+            raise ClientError("Background job workspace no longer exists.")
+        os.chdir(cwd)
+        with temporary.open("w", encoding="utf-8") as output, (directory / "worker.log").open(
+            "a", encoding="utf-8"
+        ) as log, contextlib.redirect_stdout(output), contextlib.redirect_stderr(log):
+            exit_code = main(argv)
+    except BaseException as error:
+        with temporary.open("w", encoding="utf-8") as output:
+            emit({"status": "error", "error": f"Background worker failed: {error}"}, stream=output)
+        exit_code = 1
+    temporary.replace(directory / "result.json")
+    payload = read_json_file(directory / "result.json")
+    job.update(
+        status="succeeded" if exit_code == 0 and isinstance(payload, dict)
+        and payload.get("status") == "ok" else "failed",
+        exit_code=exit_code,
+        finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+    )
+    write_json_file(directory / "job.json", job)
+    return 0
+
+
+def command_status(args: argparse.Namespace) -> int:
+    thread_id = resolve_thread_id(args.thread_id)
+    state_dir = thread_state_dir(thread_id)
+    job_id = args.job_id or latest_job_id(state_dir)
+    if not job_id:
+        raise ClientError("No background image job is recorded for this Codex task.")
+    directory = job_directory(state_dir, job_id)
+    job = read_json_file(directory / "job.json")
+    if not isinstance(job, dict):
+        raise ClientError(f"Background job {job_id} has no readable status record.")
+    payload = read_json_file(directory / "result.json")
+    if isinstance(payload, dict):
+        result = dict(payload)
+        result.update(background=True, job_id=job_id, job_status=job.get("status"))
+        emit(result)
+        return 0 if result.get("status") == "ok" else 1
+    status = str(job.get("status", "unknown"))
+    if status in {"starting", "running"} and job.get("pid") and not process_is_running(job.get("pid")):
+        status = "failed"
+        job.update(
+            status=status, finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+            error="The background worker stopped before writing a result.",
+        )
+        write_json_file(directory / "job.json", job)
+    emit({
+        "status": status, "background": True, "job_id": job_id,
+        "thread_id": thread_id, "model": job.get("model"),
+        "requested_size": job.get("requested_size"), "started_at": job.get("started_at"),
+        "pid": job.get("pid"), "error": job.get("error"),
+        "message": (
+            "Background image job is still running; poll this job again and do not resubmit."
+            if status in {"starting", "running"}
+            else "Background image job ended without a recoverable image result."
+        ),
+    })
+    return 0 if status in {"starting", "running"} else 1
+
+
 def command_last(args: argparse.Namespace) -> int:
     thread_id = resolve_thread_id(args.thread_id)
     state_dir = thread_state_dir(thread_id)
@@ -1153,24 +1434,7 @@ def command_run(args: argparse.Namespace) -> int:
 
     model = args.model
 
-    size = choose_size(args.size, args.aspect)
-    high_resolution_intent = has_high_resolution_intent(args.prompt)
-    if high_resolution_intent and not args.confirm_high_res:
-        raise ClientError(
-            "The prompt expresses high-resolution intent. Run models, present the published "
-            "and experimental sizes, obtain user confirmation, and retry with an explicit "
-            "--size plus --confirm-high-res."
-        )
-    if high_resolution_intent and not args.size:
-        raise ClientError(
-            "Confirmed high-resolution intent requires an explicit --size; refusing to send "
-            "a default 1K request."
-        )
-    if size not in CONSERVATIVE_SIZES and not args.confirm_high_res:
-        raise ClientError(
-            f"Size {size} requires user confirmation. Run models, present published and "
-            "experimental sizes, then retry with --confirm-high-res."
-        )
+    size = validate_size_request(args)
 
     thread_id = resolve_thread_id(args.thread_id)
     state_dir = thread_state_dir(thread_id)
@@ -1280,6 +1544,27 @@ def command_run(args: argparse.Namespace) -> int:
     return 1
 
 
+def add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--prompt", required=True)
+    parser.add_argument("--model")
+    parser.add_argument("--selection-token")
+    parser.add_argument("--image", action="append", default=[])
+    parser.add_argument("--use-last", action="store_true")
+    parser.add_argument("--mode", choices=("auto", "generate", "edit"), default="auto")
+    parser.add_argument(
+        "--endpoint", choices=("auto", "images", "chat", "custom"), default="auto"
+    )
+    parser.add_argument("--custom-url")
+    parser.add_argument("--custom-kind", choices=("images", "chat"))
+    parser.add_argument("--size")
+    parser.add_argument("--aspect", default="square")
+    parser.add_argument("--confirm-high-res", action="store_true")
+    parser.add_argument("--base-url")
+    parser.add_argument("--output-dir")
+    parser.add_argument("--thread-id")
+    parser.add_argument("--timeout", type=float, default=600.0)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate and edit images through Keylink-compatible APIs."
@@ -1298,37 +1583,36 @@ def build_parser() -> argparse.ArgumentParser:
     last.set_defaults(handler=command_last)
 
     run = subparsers.add_parser("run", help="Generate or edit an image.")
-    run.add_argument("--prompt", required=True)
-    run.add_argument("--model")
-    run.add_argument("--selection-token")
-    run.add_argument("--image", action="append", default=[])
-    run.add_argument("--use-last", action="store_true")
-    run.add_argument("--mode", choices=("auto", "generate", "edit"), default="auto")
-    run.add_argument(
-        "--endpoint", choices=("auto", "images", "chat", "custom"), default="auto"
-    )
-    run.add_argument("--custom-url")
-    run.add_argument("--custom-kind", choices=("images", "chat"))
-    run.add_argument("--size")
-    run.add_argument("--aspect", default="square")
-    run.add_argument("--confirm-high-res", action="store_true")
-    run.add_argument("--base-url")
-    run.add_argument("--output-dir")
-    run.add_argument("--thread-id")
-    run.add_argument("--timeout", type=float, default=600.0)
+    add_run_arguments(run)
     run.set_defaults(handler=command_run)
+
+    start = subparsers.add_parser(
+        "start", help="Start a detached image job that survives a Codex task interruption."
+    )
+    add_run_arguments(start)
+    start.set_defaults(handler=command_start)
+
+    status = subparsers.add_parser("status", help="Read a background image job result.")
+    status.add_argument("--job-id")
+    status.add_argument("--thread-id")
+    status.set_defaults(handler=command_status)
+
+    worker = subparsers.add_parser("_worker", help=argparse.SUPPRESS)
+    worker.add_argument("--job-dir", required=True)
+    worker.set_defaults(handler=command_worker)
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if getattr(args, "command", None) == "run" and not args.prompt.strip():
+    is_request = getattr(args, "command", None) in {"run", "start"}
+    if is_request and not args.prompt.strip():
         raise ClientError("A non-empty --prompt is required. No request was sent.")
-    if getattr(args, "command", None) == "run" and not args.model:
+    if is_request and not args.model:
         raise ClientError(
             "--model is required. Run models, show the available image models to the user, "
             "and wait for their choice."
         )
-    if getattr(args, "command", None) == "run" and not args.selection_token:
+    if is_request and not args.selection_token:
         raise ClientError(
             "--selection-token is required. Run models immediately before this request, "
             "show the available image models, and wait for the user's choice."
