@@ -692,6 +692,52 @@ class KeylinkImageTests(unittest.TestCase):
             self.assertIn("No background image job", result["error"])
             self.assertEqual(server.requests, [])
 
+    @unittest.skipUnless(os.name == "nt", "Windows scheduled-task fallback")
+    def test_windows_fallback_records_task_before_starting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            workspace = Path(temporary)
+            state_dir = workspace / ".keylink-image" / "threads" / "test-thread"
+            token = client_module.save_model_selection(
+                state_dir,
+                [{"id": "gpt-image-2.5", "image_candidate": True,
+                  "published_sizes": []}],
+                "http://127.0.0.1:4321",
+            )
+            args = client_module.build_parser().parse_args([
+                "start", "--prompt", "a 4K black hole", "--model", "gpt-image-2.5",
+                "--selection-token", token, "--size", "3840x2160",
+                "--confirm-high-res", "--base-url", "http://127.0.0.1:4321",
+                "--thread-id", "test-thread",
+            ])
+            observed: dict[str, Any] = {}
+
+            def start_scheduled(task_name: str, cwd: str) -> None:
+                latest = json.loads((state_dir / "latest-job.json").read_text(encoding="utf-8"))
+                job_path = state_dir / "jobs" / latest["job_id"] / "job.json"
+                recorded = json.loads(job_path.read_text(encoding="utf-8"))
+                observed.update(recorded)
+                self.assertEqual(recorded["task_name"], task_name)
+                self.assertEqual(recorded["launch_mode"], "scheduled-task")
+                self.assertEqual(Path(cwd), workspace.resolve())
+
+            output = io.StringIO()
+            with mock.patch.object(client_module.Path, "cwd", return_value=workspace), \
+                    mock.patch.object(client_module.subprocess, "Popen",
+                                      side_effect=PermissionError("breakaway denied")), \
+                    mock.patch.object(client_module, "create_windows_worker_task",
+                                      return_value=r"\KeylinkImage-test"), \
+                    mock.patch.object(client_module, "run_windows_worker_task",
+                                      side_effect=start_scheduled) as run_task, \
+                    contextlib.redirect_stdout(output):
+                exit_code = client_module.command_start(args)
+            self.assertEqual(exit_code, 0)
+            result = json.loads(output.getvalue())
+            self.assertEqual(result["launch_mode"], "scheduled-task")
+            self.assertEqual(result["task_name"], r"\KeylinkImage-test")
+            self.assertIsNone(result["pid"])
+            self.assertTrue(observed)
+            run_task.assert_called_once()
+
     def test_run_requires_model_discovery_selection_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:
             completed, payload = self.run_client(

@@ -1162,6 +1162,63 @@ def process_is_running(pid: Any) -> bool:
     return True
 
 
+def create_windows_worker_task(command: list[str], cwd: str, job_id: str) -> str:
+    if os.name != "nt":
+        raise ClientError("Windows task scheduling is only available on Windows.")
+    schtasks = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "schtasks.exe"
+    if not schtasks.is_file():
+        raise ClientError("Windows task scheduler is unavailable; the high-resolution job was not started.")
+    task_name = r"\KeylinkImage-" + job_id
+    command_line = subprocess.list2cmdline(command)
+    start_time = time.strftime("%H:%M", time.localtime(time.time() + 60))
+    create = subprocess.run(
+        [str(schtasks), "/Create", "/TN", task_name, "/SC", "ONCE",
+         "/ST", start_time, "/TR", command_line, "/F"],
+        cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="mbcs", errors="replace",
+        check=False,
+    )
+    if create.returncode != 0:
+        detail = (create.stderr or create.stdout).strip()
+        raise ClientError(
+            "Windows task scheduler could not create the persistent image job"
+            + (f": {detail}" if detail else ".")
+        )
+    return task_name
+
+
+def run_windows_worker_task(task_name: str, cwd: str) -> None:
+    schtasks = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "schtasks.exe"
+    start = subprocess.run(
+        [str(schtasks), "/Run", "/TN", task_name],
+        cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, encoding="mbcs", errors="replace",
+        check=False,
+    )
+    if start.returncode != 0:
+        subprocess.run(
+            [str(schtasks), "/Delete", "/TN", task_name, "/F"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        detail = (start.stderr or start.stdout).strip()
+        raise ClientError(
+            "Windows task scheduler could not start the persistent image job"
+            + (f": {detail}" if detail else ".")
+        )
+
+
+def delete_windows_task(task_name: Any) -> None:
+    if os.name != "nt" or not isinstance(task_name, str) or not task_name:
+        return
+    schtasks = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "schtasks.exe"
+    subprocess.run(
+        [str(schtasks), "/Delete", "/TN", task_name, "/F"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        check=False,
+    )
+
+
 def command_start(args: argparse.Namespace) -> int:
     base_url, _, _ = discover_base_url(args.base_url)
     thread_id = resolve_thread_id(args.thread_id)
@@ -1245,8 +1302,33 @@ def command_start(args: argparse.Namespace) -> int:
         )
     else:
         popen_kwargs["start_new_session"] = True
+    process = None
+    launch_mode = "detached-process"
+    task_name = None
     try:
         process = subprocess.Popen(command, **popen_kwargs)
+    except PermissionError:
+        if os.name != "nt":
+            raise
+        try:
+            task_name = create_windows_worker_task(command, request["cwd"], job_id)
+            launch_mode = "scheduled-task"
+            job.update(task_name=task_name, launch_mode=launch_mode)
+            write_json_file(directory / "job.json", job)
+            run_windows_worker_task(task_name, request["cwd"])
+        except ClientError as error:
+            delete_windows_task(task_name)
+            job.update(
+                status="failed",
+                finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
+                error=str(error),
+            )
+            write_json_file(directory / "job.json", job)
+            try:
+                claim.unlink()
+            except OSError:
+                pass
+            raise
     except OSError as error:
         job.update(status="failed", finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
                    error=f"Could not start background worker: {error}")
@@ -1259,7 +1341,10 @@ def command_start(args: argparse.Namespace) -> int:
 
     emit({
         "status": "started", "background": True, "job_id": job_id,
-        "pid": process.pid, "thread_id": thread_id, "model": args.model,
+        "pid": process.pid if process is not None else None,
+        "launch_mode": launch_mode,
+        "task_name": task_name,
+        "thread_id": thread_id, "model": args.model,
         "requested_size": size, "started_at": started_at,
         "status_args": ["status", "--job-id", job_id, "--thread-id", thread_id],
         "message": "Background image job started. Poll status; do not submit the request again.",
@@ -1295,6 +1380,7 @@ def command_worker(args: argparse.Namespace) -> int:
         exit_code = 1
     temporary.replace(directory / "result.json")
     payload = read_json_file(directory / "result.json")
+    delete_windows_task(job.get("task_name"))
     job.update(
         status="succeeded" if exit_code == 0 and isinstance(payload, dict)
         and payload.get("status") == "ok" else "failed",
