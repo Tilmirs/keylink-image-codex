@@ -4,6 +4,8 @@
 
 Send requests directly to `https://keylinkclub.com`, unless the user explicitly sets `--base-url` or `KEYLINK_BASE_URL`. Do not inherit `OPENAI_BASE_URL`, `OPENAI_API_BASE`, Codex provider URLs, or the CCSwitch local API listener. CCSwitch's Codex listener can return 404 for Images and reject or transform Chat requests. Its current Keylink credential can still be reused without routing any requests through the listener. Model discovery uses the same selected host and does not fall back to other providers. Ordinary HTTP network proxies remain the transport's responsibility.
 
+Credential selection is separate from request routing. An explicit `KEYLINK_API_KEY` wins. If CCSwitch is detected as running, use its current Codex Provider key and do not inspect Codex `auth.json`. If CCSwitch is not running, inspect common Codex and Codex++ `auth.json`/config locations only to report that a credential was found; require the user to confirm that it is a Keylink key before sending it. `OPENAI_API_KEY` follows the same confirmation rule when CCSwitch is stopped. A running CCSwitch without a readable Provider key is an error and does not fall back to `auth.json`.
+
 ## Automatic endpoint order
 
 | Model family | Text generation | Reference-image edit |
@@ -46,3 +48,4 @@ For high-resolution requests, `start` creates a detached worker and returns a jo
 The client accepts image URLs, `data:image/...;base64,...` values, common Base64 fields such as `b64_json`, and image values inside Chat message content or message image arrays. URL downloads inherit authentication only when the image URL uses the same host as the configured API root, preventing credentials from being sent to unrelated hosts.
 
 If a configured system HTTP proxy fails to connect to a returned image URL, retry downloading that same image directly once before treating the endpoint as failed. HTTP error responses are not retried this way. This download recovery does not issue another generation request or alter model, prompt, size, or endpoint selection.
+

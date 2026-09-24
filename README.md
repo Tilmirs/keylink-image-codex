@@ -65,15 +65,15 @@ python3 -m venv "$skill_dir/.venv"
 
 ## 凭据
 
-Skill 按以下顺序读取凭据，并且不会输出密钥：
+Skill 不会输出密钥，按以下规则选择：
 
-1. `KEYLINK_API_KEY`
-2. `OPENAI_API_KEY`
-3. 当前 CCSwitch Provider 中与 Keylink 主机匹配的凭据
+1. 明确配置的 `KEYLINK_API_KEY` 直接作为 Keylink 密钥使用。
+2. 检测 CCSwitch 是否真正运行。如果正在运行，只使用 CCSwitch 当前 Codex Provider 的密钥，不检查 `auth.json`。
+3. 如果 CCSwitch 没有运行，再检查 Codex 和 Codex++ 的常见 `auth.json`、`config.json`、`config.toml` 路径，但发现的密钥不会立即发送；Skill 会提示用户确认“这个凭据是否是 Keylink 的 Key”。用户确认后才继续，用户否认或不确定则提示启动 CCSwitch 并配置 Keylink Provider，或设置 `KEYLINK_API_KEY`。
 
-CCSwitch 仅作为凭据来源。图片 API 请求不会经过 CCSwitch 的本地监听地址。
+`OPENAI_API_KEY` 和 Codex `auth.json` 一样，在 CCSwitch 未运行时需要用户确认，因为其中可能是用户自己的 OpenAI 账号凭据。CCSwitch 正在运行但当前 Provider 没有可读密钥时直接报配置错误，不回退到 `auth.json`。CCSwitch 只提供密钥，图片请求仍直连 `https://keylinkclub.com`。
 
-Windows 和 macOS 均读取用户主目录下的 `~/.cc-switch/cc-switch.db`。没有 CCSwitch 时，可给运行 Codex 的进程配置 `KEYLINK_API_KEY`。macOS 从 Finder / Dock 打开的应用不一定继承终端中设置的环境变量；可使用匹配 Keylink 的 CCSwitch 当前 Provider，或从已配置变量的终端启动 Codex。不要把密钥写进聊天、命令参数或提交到仓库。
+Codex++ 可通过 `CODEX_PLUS_HOME`、`CODEXPP_HOME` 或 `KEYLINK_CODEX_CONFIG_DIR` 指定配置目录；也支持 `CODEX_PLUS_CONFIG`、`CODEXPP_CONFIG` 和 `KEYLINK_CODEX_AUTH_FILE` 指定文件。不要把密钥写进聊天、命令参数或提交到仓库。
 
 ### VPN 和地址
 
@@ -82,7 +82,7 @@ API 地址固定为 `https://keylinkclub.com`，只有 `KEYLINK_BASE_URL` 或 `-
 网络连接沿用 Python 支持的系统 HTTP 代理或 `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`。VPN 使用系统隧道或 HTTP / mixed 代理端口即可；本客户端不直接支持 SOCKS-only URL。代理端口应填入代理设置，不能作为 Keylink API 地址。macOS 终端需要手动指定代理时，可使用下列形式，将端口替换为 VPN 的实际 HTTP 端口：
 
 ```sh
-export HTTPS_PROXY="http://127.0.0.1:7890"
+export HTTPS_PROXY="http://127.0.0.1:<your-http-proxy-port>"
 export HTTP_PROXY="$HTTPS_PROXY"
 ```
 
@@ -150,3 +150,4 @@ python -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 macOS 也可使用 `python3` 或虚拟环境内的 Python。GitHub Actions 在 Windows 和 macOS 上运行测试；测试使用本地模拟服务，不消耗 Keylink 生图额度。
+

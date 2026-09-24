@@ -989,6 +989,83 @@ class KeylinkImageTests(unittest.TestCase):
             self.assertEqual(state.provider_base_urls, ["https://keylinkclub.com"])
             self.assertEqual(db_path.read_bytes(), original)
 
+    def test_running_ccswitch_wins_without_scanning_codex_auth(self) -> None:
+        ccswitch = client_module.CCSwitchState(
+            provider_base_urls=["http://127.0.0.1:15721"],
+            api_key="ccswitch-key",
+            running=True,
+        )
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            client_module, "discover_codex_credentials",
+            side_effect=AssertionError("Codex credentials must not be scanned"),
+        ):
+            self.assertEqual(
+                client_module.discover_api_key(
+                    "https://keylinkclub.com", "default", ccswitch
+                ),
+                ("ccswitch-key", "ccswitch-current-provider"),
+            )
+
+    def test_stopped_ccswitch_requires_confirmation_for_codex_credential(self) -> None:
+        ccswitch = client_module.CCSwitchState(
+            api_key="stale-ccswitch-key", running=False
+        )
+        credentials = [(Path("C:/Users/example/.codex++/auth.json"), "codex-key")]
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            client_module, "discover_codex_credentials", return_value=credentials
+        ):
+            with self.assertRaises(client_module.CredentialConfirmationRequired) as raised:
+                client_module.discover_api_key(
+                    "https://keylinkclub.com", "default", ccswitch
+                )
+            self.assertTrue(raised.exception.payload["credential_confirmation_required"])
+            self.assertFalse(raised.exception.payload["ccswitch_running"])
+            self.assertEqual(
+                raised.exception.payload["codex_credential_sources"],
+                ["C:\\Users\\example\\.codex++\\auth.json"],
+            )
+            self.assertEqual(
+                client_module.discover_api_key(
+                    "https://keylinkclub.com", "default", ccswitch,
+                    confirm_codex_auth=True,
+                ),
+                ("codex-key", "codex++-config"),
+            )
+
+    def test_codex_plus_config_path_is_discovered_without_exposing_key(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config = Path(temporary) / "codex-plus-config.json"
+            config.write_text(
+                json.dumps({"provider": {"api_key": "private-fixture-key"}}),
+                encoding="utf-8",
+            )
+            with mock.patch.dict(os.environ, {
+                "CODEX_PLUS_CONFIG": str(config),
+            }, clear=True):
+                credentials = client_module.discover_codex_credentials()
+            self.assertEqual(credentials, [(config.resolve(), "private-fixture-key")])
+
+    def test_credential_confirmation_result_contains_no_secret(self) -> None:
+        output = io.StringIO()
+        with mock.patch.object(
+            client_module,
+            "discover_base_url",
+            return_value=("https://keylinkclub.com", "default", client_module.CCSwitchState(running=False)),
+        ), mock.patch.object(
+            client_module,
+            "discover_api_key",
+            side_effect=client_module.CredentialConfirmationRequired(
+                ["C:/Users/example/.codex/auth.json"], ccswitch_running=False
+            ),
+        ), contextlib.redirect_stdout(output):
+            self.assertEqual(client_module.main(["models"]), 1)
+        payload = json.loads(output.getvalue())
+        self.assertTrue(payload["credential_confirmation_required"])
+        self.assertEqual(payload["codex_credential_sources"], [
+            "C:/Users/example/.codex/auth.json"
+        ])
+        self.assertNotIn("private-fixture-key", output.getvalue())
+
     def test_models_failure_is_reported_without_switching_servers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, running_server() as server:
             server.routes[("GET", "/v1/models")] = json_response(
@@ -1017,7 +1094,7 @@ class KeylinkImageTests(unittest.TestCase):
             broken_proxy.open.side_effect = urllib.error.URLError(ConnectionResetError("proxy reset"))
             client.opener = broken_proxy
             with mock.patch.object(client_module.urllib.request, "getproxies", return_value={
-                "https": "http://localhost:9567"
+                "https": "http://localhost:8080"
             }):
                 data, mime = client.download(url)
             self.assertEqual((data, mime), (PNG_BYTES, "image/png"))
@@ -1205,3 +1282,4 @@ class KeylinkImageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
