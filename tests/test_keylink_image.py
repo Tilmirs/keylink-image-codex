@@ -1021,8 +1021,8 @@ class KeylinkImageTests(unittest.TestCase):
             self.assertTrue(raised.exception.payload["credential_confirmation_required"])
             self.assertFalse(raised.exception.payload["ccswitch_running"])
             self.assertEqual(
-                raised.exception.payload["codex_credential_sources"],
-                ["C:\\Users\\example\\.codex++\\auth.json"],
+                [Path(source) for source in raised.exception.payload["codex_credential_sources"]],
+                [Path("C:/Users/example/.codex++/auth.json")],
             )
             self.assertEqual(
                 client_module.discover_api_key(
