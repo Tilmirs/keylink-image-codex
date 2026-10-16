@@ -163,7 +163,9 @@ class EditRequestTests(unittest.TestCase):
 
     def test_background_snapshot_survives_original_removal(self):
         with tempfile.TemporaryDirectory() as tmp, fixtures.running_server() as server:
-            root = Path(tmp)
+            # CI temp directories can be symlinks/junctions or Windows 8.3 aliases.
+            # Production stores resolved paths; compare them in the same form.
+            root = Path(tmp).resolve()
             ref = root / "ref.png"
             ref.write_bytes(fixtures.PNG_BYTES)
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
