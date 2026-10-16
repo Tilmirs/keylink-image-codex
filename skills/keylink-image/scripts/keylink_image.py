@@ -11,7 +11,9 @@ import csv
 import datetime as dt
 import errno
 import hashlib
+import html
 import http.client
+import io
 import json
 import mimetypes
 import os
@@ -47,7 +49,7 @@ CONSERVATIVE_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 EXPERIMENTAL_SIZES = ("2560x1440", "3840x2160")
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
 DATA_URL_RE = re.compile(
-    r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=_\s-]+)", re.I
+    r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/_-]+(?:\r?\n[A-Za-z0-9+/_-]+)*={0,2})", re.I
 )
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", re.I)
 HTTP_URL_RE = re.compile(r"https?://[^\s<>\]\[\"']+", re.I)
@@ -56,6 +58,34 @@ HIGH_RES_INTENT_RE = re.compile(
     r"higher\s+resolution|high\s+resolution|ultra\s+high\s+definition",
     re.I,
 )
+EDIT_PROMPT_MARKER_RE = re.compile(
+    r"(?im)^[ \t]*(?:#{1,6}[ \t]+)?(?:编辑提示|编辑要求|本轮修改|本次修改|"
+    r"edit\s+prompt|requested\s+change)[ \t]*(?:[:：][ \t]*|\n)"
+)
+EDIT_ROLE_LINE_RE = re.compile(
+    r"(?im)^\s*(?:system|assistant|user|developer|系统|助手|用户|开发者)\s*[:：]"
+)
+EDIT_CONTEXT_LINE_RE = re.compile(
+    r"(?im)^\s*(?:上下文|历史(?:对话|消息)?|conversation|context|transcript)\s*[:：]"
+)
+EDIT_PROMPT_MAX_CHARS = 4000
+REFERENCE_MAX_DIMENSION = 2048
+REFERENCE_MAX_IMAGE_BYTES = 2 * 1024 * 1024
+REFERENCE_MAX_TOTAL_BYTES = 3 * 1024 * 1024
+REFERENCE_MIN_DIMENSION = 768
+REFERENCE_MAX_COUNT = 16
+REQUEST_MAX_BYTES = 9 * 1024 * 1024
+IMAGE_URL_KEYS = {
+    "url", "uri", "image_url", "image_uri", "file_url", "fileurl",
+    "imageurl", "output_image", "outputimage", "generated_image", "generatedimage", "image",
+}
+BASE64_KEYS = {"b64_json", "base64", "image_base64", "imagebase64", "b64"}
+IMAGE_CONTAINER_KEYS = {
+    "data", "images", "output", "outputs", "result", "results", "choices",
+    "message", "messages", "content", "parts", "attachments", "artifacts",
+    "generated_images", "generatedimages", "output_images", "outputimages",
+    "text", "output_text", "candidates", "source", "inline_data", "inlinedata",
+}
 CORRECTION_INTENT_RE = re.compile(
     r"不满意|画面不对|刚才|上一张|上张|这张图|这幅图|继续修改|继续改|"
     r"把.+改成|换成|改一下|去掉|移除|"
@@ -140,11 +170,26 @@ class EndpointError(ClientError):
         self.endpoint = endpoint
 
 
+class APIError(ClientError):
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
+
 @dataclass(frozen=True)
 class ImageCandidate:
     kind: str
     value: str
     mime_type: str | None = None
+
+
+@dataclass(frozen=True)
+class ReferencePreparation:
+    paths: list[Path]
+    items: list[dict[str, Any]]
+    warnings: list[str]
+    original_bytes: int
+    prepared_bytes: int
 
 
 @dataclass
@@ -654,6 +699,8 @@ class HttpClient:
         self.api_key = api_key
         self.timeout = timeout
         self.opener = urllib.request.build_opener()
+        self.last_request_bytes: int | None = None
+        self.request_attempts: list[dict[str, Any]] = []
 
     def headers(self, *, json_body: bool = False) -> dict[str, str]:
         result = {
@@ -676,17 +723,14 @@ class HttpClient:
         body = None
         if payload is not None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            check_request_budget(body)
         headers = self.headers(json_body=payload is not None)
         if extra_headers:
             headers.update(extra_headers)
+        self.last_request_bytes = len(body or b"")
         request = urllib.request.Request(url, data=body, headers=headers, method=method)
-        raw, _ = self._open(request)
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ClientError(
-                f"{method} {url} returned non-JSON content: {safe_response_text(raw)}"
-            ) from error
+        raw, content_type = self._open(request)
+        return parse_api_response(raw, content_type)
 
     def request_multipart(
         self,
@@ -695,17 +739,14 @@ class HttpClient:
         image_paths: list[Path],
     ) -> Any:
         body, content_type = encode_multipart(fields, image_paths)
+        check_request_budget(body)
         headers = self.headers()
         headers["Content-Type"] = content_type
         headers["Content-Length"] = str(len(body))
+        self.last_request_bytes = len(body)
         request = urllib.request.Request(url, data=body, headers=headers, method="POST")
-        raw, _ = self._open(request)
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-            raise ClientError(
-                f"POST {url} returned non-JSON content: {safe_response_text(raw)}"
-            ) from error
+        raw, content_type = self._open(request)
+        return parse_api_response(raw, content_type)
 
     def download(self, url: str) -> tuple[bytes, str | None]:
         headers = {
@@ -736,24 +777,68 @@ class HttpClient:
     def _open(
         self, request: urllib.request.Request, *, opener: Any = None
     ) -> tuple[bytes, str | None]:
+        started = time.monotonic()
+        record = {
+            "endpoint": urllib.parse.urlsplit(request.full_url).path,
+            "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "request_bytes": len(request.data or b""), "http_status": None,
+        }
         try:
             with (opener or self.opener).open(request, timeout=self.timeout) as response:
+                record["http_status"] = response.status
                 content_type = response.headers.get_content_type()
                 return response.read(), content_type
         except urllib.error.HTTPError as error:
+            record.update(http_status=error.code, error_kind="http_error")
             try:
                 detail = safe_response_text(error.read()) or error.reason
             except (OSError, http.client.HTTPException) as read_error:
                 detail = f"{error.reason} (could not read error body: {read_error})"
             finally:
                 error.close()
-            raise ClientError(
-                f"HTTP {error.code} for {request.full_url}: {detail}"
+            raise APIError(
+                f"HTTP {error.code} for {request.full_url}: {detail}", error.code
             ) from error
         except urllib.error.URLError as error:
+            record["error_kind"] = "transport_error"
             raise ClientError(f"Request failed for {request.full_url}: {error.reason}") from error
         except (OSError, http.client.HTTPException) as error:
+            record["error_kind"] = "transport_error"
             raise ClientError(f"Request failed for {request.full_url}: {error}") from error
+        finally:
+            if request.get_method() == "POST":
+                record["elapsed_seconds"] = round(time.monotonic() - started, 3)
+                self.request_attempts.append(record)
+
+
+def check_request_budget(body: bytes) -> None:
+    if len(body) > REQUEST_MAX_BYTES:
+        raise ClientError(f"Request body is {len(body)} bytes, exceeding the client budget of {REQUEST_MAX_BYTES} bytes. Reduce references or prompt; no request was sent.")
+
+
+def parse_api_response(raw: bytes, content_type: str | None) -> Any:
+    if detect_mime_type(raw):
+        return {"b64_json": base64.b64encode(raw).decode("ascii")}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        text = raw.decode("utf-8", errors="replace").strip()
+        if content_type in {"text/plain", "text/markdown"} and extract_image_candidates(text):
+            return {"content": text}
+        raise ClientError("The endpoint returned non-JSON content without a recognized image response.") from error
+    if isinstance(payload, dict):
+        nested = payload.get("error")
+        code = payload.get("status_code", payload.get("code"))
+        if isinstance(nested, dict):
+            code = nested.get("status_code", nested.get("code", code))
+        try:
+            status = int(code)
+        except (ValueError, TypeError):
+            status = None
+        if nested or (status is not None and status >= 400):
+            detail = safe_response_text(json.dumps(nested or payload, ensure_ascii=False).encode("utf-8"))
+            raise APIError(f"API error{f' {status}' if status else ''}: {detail}", status)
+    return payload
 
 
 def encode_multipart(
@@ -845,6 +930,71 @@ def has_correction_intent(prompt: str) -> bool:
     return bool(CORRECTION_INTENT_RE.search(prompt))
 
 
+def extract_current_prompt(prompt: str) -> str:
+    """Unwrap explicit transcripts only; never guess which visual details matter."""
+    value = prompt.strip()
+    fenced = re.fullmatch(r"```(?:json|text|markdown)?\s*\n(.*?)\n```", value, re.S | re.I)
+    if fenced:
+        value = fenced.group(1).strip()
+    try:
+        structured = json.loads(value)
+    except (ValueError, TypeError):
+        structured = None
+    if isinstance(structured, dict):
+        messages = structured.get("messages")
+        if isinstance(messages, list):
+            users = [m for m in messages if isinstance(m, dict) and m.get("role") == "user"]
+            if users:
+                content = users[-1].get("content")
+                if isinstance(content, list):
+                    content = "\n".join(p["text"] for p in content
+                                        if isinstance(p, dict) and isinstance(p.get("text"), str))
+                if isinstance(content, str):
+                    value = content.strip()
+        elif isinstance(structured.get("prompt"), str):
+            value = structured["prompt"].strip()
+    # XML conversation wrappers are common in copied Codex context.
+    users = list(re.finditer(r"<user(?:\s[^>]*)?>(.*?)</user>", value, re.S | re.I))
+    if users:
+        value = users[-1].group(1).strip()
+    roles = list(EDIT_ROLE_LINE_RE.finditer(value))
+    user_roles = [m for m in roles if re.search(r"(?:user|用户)\s*[:：]", m.group(), re.I)]
+    if user_roles and roles[0].start() == 0:
+        last = user_roles[-1]
+        end = next((m.start() for m in roles if m.start() > last.start()), len(value))
+        value = value[last.end():end].strip()
+    markers = list(EDIT_PROMPT_MARKER_RE.finditer(value))
+    if markers:
+        value = value[markers[-1].end():].strip()
+    return value
+
+
+def sanitize_edit_prompt(prompt: str) -> tuple[str, dict[str, Any]]:
+    value = extract_current_prompt(prompt)
+    # Remove explicitly tagged non-prompt material, not arbitrary prose or code
+    # the user may want depicted in the image.
+    value = re.sub(
+        r"<(context|history|system|developer|tool_result|environment_context)(?:\s[^>]*)?>"
+        r".*?</\1>", "", value, flags=re.S | re.I,
+    ).strip()
+    value = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", value)
+    if not value:
+        raise ClientError("The edit prompt is empty after removing conversation wrappers. Supply only the requested changes; no request was sent.")
+    if EDIT_ROLE_LINE_RE.search(value) or EDIT_CONTEXT_LINE_RE.search(value):
+        raise ClientError("The edit prompt still contains conversation/context sections. Supply only the current edit instructions; no request was sent.")
+    if len(value) > EDIT_PROMPT_MAX_CHARS:
+        raise ClientError(
+            f"Edit prompt has {len(value)} characters after cleanup (client limit {EDIT_PROMPT_MAX_CHARS}). "
+            "Summarize the current changes while preserving required text and constraints; no request was sent."
+        )
+    if "data:image/" in value.lower():
+        raise ClientError("Pass reference images through --image, not Base64 inside the edit prompt; no request was sent.")
+    return value, {
+        "compacted": value != prompt.strip(), "original_chars": len(prompt),
+        "sent_chars": len(value), "sent_bytes": len(value.encode("utf-8")),
+    }
+
+
 def extract_sizes(value: Any) -> list[str]:
     found: set[str] = set()
 
@@ -923,9 +1073,28 @@ def format_model_catalog(payload: Any) -> list[dict[str, Any]]:
                 "id": model_id,
                 "image_candidate": is_image_model(model_id, entry),
                 "published_sizes": extract_sizes(entry),
+                "reference_image_limits": published_reference_limits(entry),
             }
         )
     return result
+
+
+def published_reference_limits(entry: Any) -> dict[str, int]:
+    """Only explicit input-image limits count; output sizes are unrelated."""
+    if not isinstance(entry, dict):
+        return {}
+    limits: dict[str, int] = {}
+    for container in (entry, entry.get("capabilities")):
+        if not isinstance(container, dict):
+            continue
+        for key in ("reference_image_limits", "input_image_limits"):
+            source = container.get(key)
+            if isinstance(source, dict):
+                for field in ("max_bytes", "max_total_bytes", "max_width", "max_height", "max_images"):
+                    value = source.get(field)
+                    if type(value) is int and value > 0:
+                        limits[field] = min(limits.get(field, value), value)
+    return limits
 
 
 def endpoint_order(_model: str, endpoint_mode: str) -> list[str]:
@@ -1068,6 +1237,145 @@ def validate_reference_paths(paths: Iterable[str]) -> list[Path]:
     return result
 
 
+def prepare_reference_images(
+    paths: list[Path], destination: Path, published: dict[str, int] | None = None,
+    *, snapshot: bool = False,
+) -> ReferencePreparation:
+    limits = published or {}
+    max_count = min(REFERENCE_MAX_COUNT, limits.get("max_images", REFERENCE_MAX_COUNT))
+    if len(paths) > max_count:
+        raise ClientError(f"Too many reference images ({len(paths)}); current limit is {max_count}. Choose fewer references; none were discarded.")
+    total_budget = min(REFERENCE_MAX_TOTAL_BYTES, limits.get("max_total_bytes", REFERENCE_MAX_TOTAL_BYTES))
+    budget = min(REFERENCE_MAX_IMAGE_BYTES, limits.get("max_bytes", REFERENCE_MAX_IMAGE_BYTES),
+                 total_budget // max(1, len(paths)))
+    bounds = (min(REFERENCE_MAX_DIMENSION, limits.get("max_width", REFERENCE_MAX_DIMENSION)),
+              min(REFERENCE_MAX_DIMENSION, limits.get("max_height", REFERENCE_MAX_DIMENSION)))
+    prepared: list[Path] = []
+    items: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for index, path in enumerate(paths):
+        try:
+            if path.stat().st_size > 128 * 1024 * 1024:
+                raise ClientError(f"Reference {index + 1} exceeds the 128 MiB local processing limit. Export a smaller source image first.")
+            raw = path.read_bytes()
+            mime = detect_mime_type(raw)
+            dimensions = detect_dimensions(raw, mime)
+            original_dimensions = dimensions
+            original_bytes = len(raw)
+            original_raw = raw
+            try:
+                from PIL import Image, ImageOps
+            except ImportError:
+                Image = None
+            if Image is None:
+                if (mime not in {"image/png", "image/jpeg", "image/webp"} or not dimensions
+                        or dimensions[0] <= 0 or dimensions[1] <= 0
+                        or dimensions[0] > bounds[0] or dimensions[1] > bounds[1]
+                        or len(raw) > budget):
+                    raise ClientError("Reference image needs validation/resizing/compression. Install Pillow in the Python runtime used by this skill and retry; no request was sent.")
+            else:
+                try:
+                    source = Image.open(path)
+                except Image.DecompressionBombError as error:
+                    raise ClientError("Reference has too many pixels to process safely. Export a smaller source image first.") from error
+                with source:
+                    original_dimensions = source.size
+                    if getattr(source, "n_frames", 1) > 1:
+                        raise ClientError("Animated references are not supported. Export the intended frame as PNG/JPEG first.")
+                    source.verify()
+                with Image.open(path) as source:
+                    orientation = source.getexif().get(274, 1)
+                    needs_change = (mime not in {"image/png", "image/jpeg", "image/webp"}
+                                    or source.width > bounds[0] or source.height > bounds[1]
+                                    or len(raw) > budget or orientation != 1)
+                    if needs_change:
+                        picture = ImageOps.exif_transpose(source)
+                        picture.thumbnail(bounds, Image.Resampling.LANCZOS)
+                        alpha = "A" in picture.getbands() or "transparency" in picture.info
+                        picture = picture.convert("RGBA" if alpha else "RGB")
+                        picture.info.clear()
+                        floor = min(max(picture.size), REFERENCE_MIN_DIMENSION)
+                        while True:
+                            buffer = io.BytesIO()
+                            picture.save(buffer, "PNG", optimize=True)
+                            raw, mime = buffer.getvalue(), "image/png"
+                            if len(raw) > budget and not alpha:
+                                for quality in (90, 82, 74):
+                                    buffer = io.BytesIO()
+                                    picture.save(buffer, "JPEG", quality=quality, optimize=True)
+                                    raw, mime = buffer.getvalue(), "image/jpeg"
+                                    if len(raw) <= budget:
+                                        break
+                            if len(raw) <= budget:
+                                break
+                            if max(picture.size) <= floor:
+                                raise ClientError("References cannot fit the request budget without excessive detail loss. Use fewer/smaller references; no request was sent.")
+                            edge = max(floor, int(max(picture.size) * 0.8))
+                            picture.thumbnail((edge, edge), Image.Resampling.LANCZOS)
+                        dimensions = picture.size
+                    else:
+                        dimensions = source.size
+            changed = raw != original_raw
+            target = path
+            # Use durable task/job storage, never a short-lived TemporaryDirectory.
+            if changed or snapshot or mimetypes.guess_type(path.name)[0] != mime:
+                folder = destination / str(index + 1)
+                folder.mkdir(parents=True, exist_ok=True)
+                target = folder / (safe_slug(path.stem) + extension_for_mime(mime))
+                target.write_bytes(raw)
+            prepared.append(target.resolve())
+            items.append({
+                "source_path": str(path), "request_path": str(target.resolve()),
+                "original_bytes": original_bytes, "prepared_bytes": len(raw),
+                "original_dimensions": list(original_dimensions) if original_dimensions else None,
+                "prepared_dimensions": list(dimensions) if dimensions else None,
+                "mime_type": mime, "normalized": changed,
+            })
+            if changed:
+                warnings.append(f"Reference {index + 1} normalized for upload: {original_dimensions} / {original_bytes} bytes → {dimensions} / {len(raw)} bytes. Original preserved.")
+        except (OSError, ValueError) as error:
+            raise ClientError(f"Cannot prepare reference {index + 1}: {error}") from error
+    return ReferencePreparation(prepared, items, warnings,
+                                sum(item["original_bytes"] for item in items),
+                                sum(item["prepared_bytes"] for item in items))
+
+
+def prepare_request_inputs(
+    args: argparse.Namespace, state_dir: Path, selection: dict[str, Any],
+    destination: Path, *, snapshot: bool = False,
+) -> dict[str, Any]:
+    references = validate_reference_paths(args.image)
+    source = "uploaded" if references else "none"
+    current_prompt = extract_current_prompt(args.prompt)
+    use_last = args.use_last or args.mode == "edit" or (
+        args.mode == "auto" and has_correction_intent(current_prompt)
+    )
+    if not references and use_last:
+        references = [load_last_image(state_dir)]
+        source = "last-successful-image" if args.use_last or args.mode == "edit" else "auto-correction-last-image"
+    if args.mode == "generate" and references:
+        raise ClientError("Generate mode cannot discard reference images. Use auto or edit mode.")
+    prompt, info = sanitize_edit_prompt(args.prompt) if references else (args.prompt, {
+        "compacted": False, "original_chars": len(args.prompt),
+        "sent_chars": len(args.prompt), "sent_bytes": len(args.prompt.encode("utf-8")),
+    })
+    args.prompt = prompt
+    validate_size_request(args)
+    entry = next((entry for entry in selection.get("models", [])
+                  if isinstance(entry, dict) and entry.get("id") == args.model), {})
+    preparation = prepare_reference_images(references, destination,
+                                          entry.get("reference_image_limits"), snapshot=snapshot)
+    return {
+        "prompt": prompt, "prompt_info": info, "reference_source": source,
+        "references": [str(path) for path in references],
+        "request_references": [str(path) for path in preparation.paths],
+        "reference_images": preparation.items, "reference_warnings": preparation.warnings,
+        "original_reference_bytes": preparation.original_bytes,
+        "prepared_reference_bytes": preparation.prepared_bytes,
+        "reference_limit_source": "published-and-client-budget" if entry.get("reference_image_limits") else "client-budget",
+    }
+
+
 def save_last_state(
     state_dir: Path,
     image_path: Path,
@@ -1090,16 +1398,16 @@ def save_last_state(
 
 
 def build_chat_payload(
-    prompt: str, model: str, size: str, references: list[Path]
+    prompt: str, model: str, size: str, references: list[Path], *, image_url_object: bool = False,
 ) -> dict[str, Any]:
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    compatible_images: list[dict[str, str]] = []
+    compatible_images: list[dict[str, Any]] = []
     for path in references:
         data_url = image_to_data_url(path)
         content.append(
             {"type": "image_url", "image_url": {"url": data_url}}
         )
-        compatible_images.append({"image_url": data_url})
+        compatible_images.append({"image_url": {"url": data_url} if image_url_object else data_url})
     payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": content}],
@@ -1121,7 +1429,17 @@ def attempt_chat(
 ) -> tuple[Any, str]:
     url = custom_url or endpoint_url(client.base_url, "/v1/chat/completions")
     payload = build_chat_payload(prompt, model, size, references)
-    return client.request_json("POST", url, payload), "chat"
+    try:
+        return client.request_json("POST", url, payload), "chat"
+    except APIError as error:
+        # Only a definite field-validation rejection permits one format retry.
+        # A disconnect, 413, no-image result, or download failure never does.
+        if not (references and error.status_code in {400, 422}
+                and re.search(r"images\s*\[.*?\]\s*\.\s*image_url", str(error), re.I)
+                and re.search(r"required|invalid|must|expected|type|unmarshal", str(error), re.I)):
+            raise
+        payload = build_chat_payload(prompt, model, size, references, image_url_object=True)
+        return client.request_json("POST", url, payload), "chat"
 
 
 def attempt_images(
@@ -1155,19 +1473,39 @@ def extract_image_candidates(payload: Any) -> list[ImageCandidate]:
     candidates: list[ImageCandidate] = []
     seen: set[tuple[str, str]] = set()
 
-    def from_string(value: str, hint: str | None = None) -> None:
+    def add_url(value: str) -> None:
+        url = html.unescape(value).strip().strip('<>"\'`')
+        url = url.rstrip(".,;，。；！!）】")
+        while url.endswith(")") and url.count(")") > url.count("("):
+            url = url[:-1]
+        if url.lower().startswith(("http://", "https://")):
+            add_candidate(candidates, seen, ImageCandidate("url", url))
+
+    def from_string(value: str, hint: str | None, depth: int) -> None:
         stripped = value.strip()
         if not stripped:
             return
+        if stripped.startswith(("{", "[", "```json")):
+            serialized = re.sub(r"^```json\s*|\s*```$", "", stripped, flags=re.I)
+            try:
+                decoded = json.loads(serialized)
+            except ValueError:
+                pass
+            else:
+                walk(decoded, hint, depth + 1)
+                return
         data_match = DATA_URL_RE.fullmatch(stripped)
         if data_match:
             add_candidate(candidates, seen, ImageCandidate("data_url", stripped, data_match.group(1)))
             return
-        if hint in {"b64_json", "base64", "image_base64", "b64"}:
+        if hint in BASE64_KEYS:
             add_candidate(candidates, seen, ImageCandidate("base64", stripped))
             return
-        if hint in {"url", "image_url"} and stripped.lower().startswith(("http://", "https://")):
-            add_candidate(candidates, seen, ImageCandidate("url", stripped))
+        if hint in IMAGE_URL_KEYS and stripped.lower().startswith(("http://", "https://")) and not re.search(r"\s", stripped):
+            add_url(stripped)
+            return
+        if hint in IMAGE_URL_KEYS | {"data", "result"} and re.match(r"^(?:iVBORw0KGgo|/9j/|R0lGOD|UklGR)", stripped):
+            add_candidate(candidates, seen, ImageCandidate("base64", stripped))
             return
         for match in DATA_URL_RE.finditer(stripped):
             add_candidate(
@@ -1175,17 +1513,24 @@ def extract_image_candidates(payload: Any) -> list[ImageCandidate]:
                 seen,
                 ImageCandidate("data_url", match.group(0), match.group(1)),
             )
-        for match in MARKDOWN_IMAGE_RE.finditer(stripped):
-            add_candidate(candidates, seen, ImageCandidate("url", match.group(1).rstrip(".,;")))
-        if hint in {"content", "text", "output_text"}:
+        for match in re.finditer(r"!\[[^\]]*\]\(<?(https?://[^\s>]+?)>?(?:\s+[\"'][^\"']*[\"'])?\)", stripped, re.I):
+            add_url(match.group(1))
+        for match in re.finditer(r"<img\b[^>]*\bsrc\s*=\s*[\"']([^\"']+)[\"']", stripped, re.I):
+            from_string(html.unescape(match.group(1)), "image_url", depth + 1)
+        if hint in {None, "content", "text", "output_text", "result", "output"}:
             for match in HTTP_URL_RE.finditer(stripped):
-                add_candidate(candidates, seen, ImageCandidate("url", match.group(0).rstrip(".,;:)")))
+                url = match.group(0).rstrip("`.,;:，。；！!）】")
+                # Text may contain documentation/help links. Only accept naked
+                # URLs, image extensions, or links introduced as image results.
+                if (stripped == match.group(0) or re.search(r"\.(png|jpe?g|webp|gif|avif)(?:[?#)]|$)", url, re.I)
+                        or re.search(r"图片|图像|下载|image|download", stripped[:match.start()], re.I)):
+                    add_url(url)
 
     def walk(value: Any, hint: str | None = None, depth: int = 0) -> None:
-        if depth > 12:
+        if depth > 16:
             return
         if isinstance(value, str):
-            from_string(value, hint)
+            from_string(value, hint, depth)
             return
         if isinstance(value, list):
             for item in value:
@@ -1194,36 +1539,17 @@ def extract_image_candidates(payload: Any) -> list[ImageCandidate]:
         if not isinstance(value, dict):
             return
 
-        image_url = value.get("image_url")
-        if isinstance(image_url, dict):
-            walk(image_url.get("url"), "image_url", depth + 1)
-        elif isinstance(image_url, str):
-            walk(image_url, "image_url", depth + 1)
-
-        for key in ("url", "b64_json", "base64", "image_base64", "b64"):
-            if key in value:
-                walk(value[key], key, depth + 1)
-
-        for key in (
-            "data",
-            "images",
-            "output",
-            "result",
-            "results",
-            "choices",
-            "message",
-            "content",
-            "parts",
-            "attachments",
-        ):
-            if key in value:
-                walk(value[key], key, depth + 1)
-
-        item_type = str(value.get("type", "")).lower()
-        if "image" in item_type:
-            for key, nested in value.items():
-                if key not in {"type", "url", "image_url", "b64_json", "base64", "image_base64", "b64"}:
-                    walk(nested, key, depth + 1)
+        normalized = {key.lower(): nested for key, nested in value.items()}
+        item_type = str(normalized.get("type", "")).lower()
+        mime = str(normalized.get("mime_type", normalized.get("mimetype", normalized.get("media_type", ""))))
+        image_context = "image" in item_type or mime.startswith("image/") or hint in {"image", "output_image", "source", "inline_data", "inlinedata"}
+        for key, nested in normalized.items():
+            if key in {"prompt", "revised_prompt", "input", "metadata", "usage", "error"}:
+                continue
+            if image_context and key in {"data", "result"} and isinstance(nested, str):
+                walk(nested, "base64" if not nested.startswith(("data:", "http://", "https://")) else "image_url", depth + 1)
+            elif key in IMAGE_URL_KEYS | BASE64_KEYS | IMAGE_CONTAINER_KEYS:
+                walk(nested, key, depth + 1)
 
     walk(payload)
     return candidates
@@ -1350,8 +1676,8 @@ def save_candidates(
         try:
             raw, declared_mime = decode_candidate(candidate, client)
             detected_mime = detect_mime_type(raw)
-            mime_type = detected_mime or declared_mime
-            if not raw or not mime_type or not mime_type.startswith("image/"):
+            mime_type = detected_mime
+            if not raw or not mime_type:
                 raise ClientError("Downloaded or decoded content is not a recognized image.")
             extension = extension_for_mime(mime_type)
             filename = (
@@ -1373,8 +1699,24 @@ def save_candidates(
             failures.append(f"candidate {index}: {error}")
 
     if not saved:
-        raise ClientError("All returned images failed to save: " + "; ".join(failures))
+        raise ClientError("Image candidates were returned, but download/decoding/validation failed: " + "; ".join(failures))
     return saved, failures
+
+
+def response_shape(payload: Any) -> Any:
+    """Diagnostic structure only: no prompt, Base64, signed URLs or credentials."""
+    def shape(value: Any, depth: int = 0) -> Any:
+        if depth > 5:
+            return type(value).__name__
+        if isinstance(value, dict):
+            return {safe_slug(str(key), 48): shape(nested, depth + 1)
+                    for key, nested in list(value.items())[:24]}
+        if isinstance(value, list):
+            return {"count": len(value), "sample": [shape(item, depth + 1) for item in value[:2]]}
+        if isinstance(value, str):
+            return {"type": "string", "chars": len(value)}
+        return type(value).__name__
+    return shape(payload)
 
 
 def model_catalog(client: HttpClient) -> list[dict[str, Any]]:
@@ -1614,11 +1956,9 @@ def command_start(args: argparse.Namespace) -> int:
     base_url, _, _ = discover_base_url(args.base_url)
     thread_id = resolve_thread_id(args.thread_id)
     state_dir = thread_state_dir(thread_id)
-    size = validate_size_request(args)
-    validate_model_selection(
+    selection = validate_model_selection(
         state_dir, args.selection_token, args.model, base_url
     )
-    validate_reference_paths(args.image)
 
     job_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:12]
     claim = state_dir / "jobs" / ("selection-" + hashlib.sha256(
@@ -1637,6 +1977,8 @@ def command_start(args: argparse.Namespace) -> int:
 
     directory = job_directory(state_dir, job_id)
     directory.mkdir(parents=True, exist_ok=False)
+    prepared_input = prepare_request_inputs(args, state_dir, selection, directory / "references", snapshot=True)
+    size = validate_size_request(args)
     try:
         claim_fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
@@ -1665,6 +2007,7 @@ def command_start(args: argparse.Namespace) -> int:
     request = {
         "argv": run_argv(args, thread_id),
         "cwd": str(Path.cwd().resolve()),
+        "prepared_input": prepared_input,
     }
     job = {
         "job_id": job_id, "status": "starting", "thread_id": thread_id,
@@ -1737,6 +2080,9 @@ def command_start(args: argparse.Namespace) -> int:
         "task_name": task_name,
         "thread_id": thread_id, "model": args.model,
         "requested_size": size, "started_at": started_at,
+        "prompt_info": prepared_input["prompt_info"],
+        "reference_images": prepared_input["reference_images"],
+        "warnings": prepared_input["reference_warnings"],
         "status_args": ["status", "--job-id", job_id, "--thread-id", thread_id],
         "message": "Background image job started. Poll status; do not submit the request again.",
     })
@@ -1764,7 +2110,7 @@ def command_worker(args: argparse.Namespace) -> int:
         with temporary.open("w", encoding="utf-8") as output, (directory / "worker.log").open(
             "a", encoding="utf-8"
         ) as log, contextlib.redirect_stdout(output), contextlib.redirect_stderr(log):
-            exit_code = main(argv)
+            exit_code = main(argv, prepared_input=request.get("prepared_input"))
     except BaseException as error:
         with temporary.open("w", encoding="utf-8") as output:
             emit({"status": "error", "error": f"Background worker failed: {error}"}, stream=output)
@@ -1937,29 +2283,18 @@ def command_run(args: argparse.Namespace) -> int:
 
     model = args.model
 
-    size = validate_size_request(args)
-
     thread_id = resolve_thread_id(args.thread_id)
     state_dir = thread_state_dir(thread_id)
-    references = validate_reference_paths(args.image)
-    reference_source = "uploaded" if references else "none"
-    should_use_last = (
-        args.use_last
-        or args.mode == "edit"
-        or (args.mode == "auto" and has_correction_intent(args.prompt))
-    )
-    if not references and should_use_last:
-        references = [load_last_image(state_dir)]
-        reference_source = (
-            "last-successful-image"
-            if args.use_last or args.mode == "edit"
-            else "auto-correction-last-image"
+    selection = validate_model_selection(state_dir, args.selection_token, model, base_url)
+    prepared_input = getattr(args, "_prepared_input", None)
+    if not prepared_input:
+        prepared_input = prepare_request_inputs(
+            args, state_dir, selection, state_dir / "request-inputs" / uuid.uuid4().hex,
         )
-
-    if args.mode == "edit" and not references:
-        raise ClientError("Edit mode requires --image or --use-last.")
-    if args.mode == "generate" and references:
-        raise ClientError("Generate mode cannot discard reference images. Use auto or edit mode.")
+    args.prompt = prepared_input["prompt"]
+    size = validate_size_request(args)
+    references = validate_reference_paths(prepared_input["request_references"])
+    reference_source = prepared_input["reference_source"]
 
     consume_model_selection(state_dir, args.selection_token, model, base_url)
 
@@ -1969,7 +2304,7 @@ def command_run(args: argparse.Namespace) -> int:
         else state_dir.resolve()
     )
 
-    attempts: list[dict[str, str]] = []
+    attempts: list[dict[str, Any]] = []
     order = endpoint_order(model, args.endpoint)
     for route in order:
         if route == "custom":
@@ -1979,7 +2314,11 @@ def command_run(args: argparse.Namespace) -> int:
             route_kind = route
             custom_url = None
 
-        endpoint_label = route_kind
+        endpoint_label = "chat" if route_kind == "chat" else ("images-edits" if references else "images-generations")
+        started = time.monotonic()
+        response = None
+        candidates = []
+        phase = "request"
         try:
             if route_kind == "chat":
                 response, endpoint_label = attempt_chat(
@@ -1993,12 +2332,15 @@ def command_run(args: argparse.Namespace) -> int:
                 raise ClientError(f"Unsupported endpoint kind: {route_kind}")
 
             candidates = extract_image_candidates(response)
+            phase = "no_image_in_response" if not candidates else "image_download_or_decode"
             saved, partial_failures = save_candidates(
                 candidates, client, output_dir, model, endpoint_label
             )
             first_path = Path(saved[0]["path"])
 
-            warnings: list[str] = []
+            warnings: list[str] = list(prepared_input["reference_warnings"])
+            if prepared_input["prompt_info"]["compacted"]:
+                warnings.append("Conversation wrappers were removed from the edit prompt; only current edit instructions were sent.")
             if attempts:
                 warnings.append(
                     f"Succeeded through {endpoint_label} after earlier endpoint failure."
@@ -2016,7 +2358,11 @@ def command_run(args: argparse.Namespace) -> int:
                     "endpoint": endpoint_label,
                     "requested_size": size,
                     "reference_source": reference_source,
-                    "references": [str(path) for path in references],
+                    "references": prepared_input["references"],
+                    "reference_images": prepared_input["reference_images"],
+                    "reference_limit_source": prepared_input["reference_limit_source"],
+                    "prompt_info": prepared_input["prompt_info"],
+                    "request_attempts": client.request_attempts,
                     "thread_id": thread_id,
                     "base_url": base_url,
                     "base_url_source": base_source,
@@ -2029,7 +2375,12 @@ def command_run(args: argparse.Namespace) -> int:
             emit(result)
             return 0
         except ClientError as error:
-            attempts.append({"endpoint": endpoint_label, "error": str(error)})
+            attempt = {"endpoint": endpoint_label, "error": str(error), "phase": phase,
+                       "elapsed_seconds": round(time.monotonic() - started, 3),
+                       "candidate_count": len(candidates)}
+            if response is not None:
+                attempt["response_shape"] = response_shape(response)
+            attempts.append(attempt)
 
     automatic = args.endpoint == "auto"
     emit(
@@ -2038,6 +2389,11 @@ def command_run(args: argparse.Namespace) -> int:
             "model": model,
             "requested_size": size,
             "reference_source": reference_source,
+            "reference_images": prepared_input["reference_images"],
+            "reference_limit_source": prepared_input["reference_limit_source"],
+            "prompt_info": prepared_input["prompt_info"],
+            "request_attempts": client.request_attempts,
+            "warnings": prepared_input["reference_warnings"],
             "base_url": base_url,
             "base_url_source": base_source,
             "attempts": attempts,
@@ -2140,9 +2496,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ClientError("--custom-url and --custom-kind require --endpoint custom.")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, prepared_input: dict[str, Any] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    args._prepared_input = prepared_input
     try:
         validate_args(args)
         return int(args.handler(args))

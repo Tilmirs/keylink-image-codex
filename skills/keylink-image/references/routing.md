@@ -21,13 +21,31 @@ If no account login is detected, API-key-only Codex/Codex++ auth/config files an
 | `gemini-3-pro-image`, `gemini-3.1-flash-image`, and Gemini image IDs | Images Generations, then Chat | Images Edits, then Chat |
 | Other pass-through model IDs | Images, then Chat | Images Edits, then Chat |
 
-Automatic fallback occurs for HTTP errors, successful responses with no image, and image download or decoding failures. Both attempts use the same model ID, prompt, size, and references. Explicit `images`, `chat`, and custom endpoint modes make exactly one attempt.
+Automatic fallback occurs for HTTP errors, successful responses with no image, and image download or decoding failures. Both endpoints use the same model ID, cleaned prompt, requested output size, and prepared references. Explicit `images`, `chat`, and custom endpoint modes stay on that endpoint.
 
 The `gpt-image-2.5` variants are distinct pass-through IDs, not aliases for `gpt-image-2.5` or `gpt-image-2`. Display only models returned by the current catalog, preserve variant suffixes in every request and saved result, and read published sizes from each variant's own catalog entry. New model names alone do not imply new size support or different API fields.
 
 Images generation uses JSON with `POST /v1/images/generations`. Images editing uses multipart form data with repeated `image` file fields at `POST /v1/images/edits`.
 
 Chat uses `POST /v1/chat/completions`. References are sent both as standard `messages[].content[].image_url` content and as compatible top-level `images[].image_url` values.
+
+The top-level compatibility field initially uses a data URL string, preserving channels that already accept it. Only a 400/422 rejection explicitly naming `images[].image_url` as missing/invalid triggers one retry on the same Chat endpoint with `{ "image_url": { "url": "data:..." } }`. This also handles a JSON `status_code` error wrapped in HTTP 200. Disconnects, 413, unrelated errors and missing-image responses do not trigger a format retry. Do not assume that a required-field error alone proves which schema the channel supports.
+
+## Edit prompts and reference budgets
+
+Only the current edit instructions belong in the prompt. The client unwraps explicit JSON `prompt`/`messages`, transcript role blocks, edit headings and tagged context. Ambiguous remaining context or more than 4,000 characters after cleanup stops locally so Codex can produce a concise prompt while retaining required image text and constraints. Ordinary generation prompts are preserved. No semantic truncation or automatic removal of visual details is performed.
+
+Default **client budgets**, not claims about Keylink's model limits:
+
+- At most 16 references, longest edge 2048 pixels, no cropping or upscaling.
+- At most 2 MiB per reference and 3 MiB across all references. The total budget is divided among references so both endpoint representations fit.
+- At most 9 MiB for the encoded request body, including the two Chat Base64 representations and prompt. Oversized bodies stop before networking.
+
+The exact selected model's explicit `reference_image_limits` or `input_image_limits`, at the entry root or in `capabilities`, can lower these budgets through integer `max_bytes`, `max_total_bytes`, `max_width`, `max_height`, and `max_images`. Output resolution metadata is never interpreted as a reference limit. When no input limits are published, `reference_limit_source` reports `client-budget`; an undocumented channel may still reject the request with 413.
+
+Pillow validates references and produces separate PNG/JPEG upload copies when needed, preserves alpha for transparent images, applies EXIF orientation, and reduces dimensions/encoding size within the budget. Animated references require an explicit exported frame. If fitting the budget would require excessive detail loss, the client stops and asks for fewer/smaller references. Original files, saved results and confirmed output resolution are preserved. Without Pillow, only recognized small supported images with readable dimensions can pass; references needing normalization stop before submission.
+
+`start` stores durable snapshots under the job directory and records the cleaned prompt, so a worker can continue even when an uploaded file is later moved. `reference_images` reports original/prepared dimensions and bytes; `prompt_info` reports character/byte counts. `request_attempts` records each POST's body size, UTC start time, elapsed seconds and HTTP status, without storing its body or authorization header. Response diagnostics retain field names/types/counts, not image data or message text.
 
 ## Sizes
 
@@ -51,6 +69,6 @@ Saving an image and displaying it are separate stages. Codex's image viewer may 
 
 For high-resolution requests, `start` creates a detached worker and returns a job ID. `status` reads the worker's atomic result file and never starts another request. If the Codex task is interrupted while Keylink is processing, resume with the same workspace and thread ID, poll `status`, and then display the saved result. A request started by an older client cannot be reconstructed from the Keylink billing log; use `last` only when the original client actually saved a local result.
 
-The client accepts image URLs, `data:image/...;base64,...` values, common Base64 fields such as `b64_json`, and image values inside Chat message content or message image arrays. URL downloads inherit authentication only when the image URL uses the same host as the configured API root, preventing credentials from being sent to unrelated hosts.
+The client accepts image URLs, data URLs, Base64 fields, camelCase URL fields, nested Chat text/images, generated image/artifact arrays, Gemini `inlineData`, and image `source.data`. Markdown/HTML image links and bare image URLs are recognized. JSON error envelopes (including `status_code=400/413` inside HTTP 200) remain API errors rather than missing-image errors. Saved files must have recognizable image bytes; an `image/*` header alone is not enough. An image candidate that failed to download/decode is diagnosed separately from a response with no candidate. URL downloads inherit authentication only when the image URL uses the same host as the configured API root, preventing credentials from being sent to unrelated hosts.
 
 If a configured system HTTP proxy fails to connect to a returned image URL, retry downloading that same image directly once before treating the endpoint as failed. HTTP error responses are not retried this way. This download recovery does not issue another generation request or alter model, prompt, size, or endpoint selection.

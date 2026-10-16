@@ -22,6 +22,7 @@
 - 每次生成或编辑前调用 `GET /v1/models`，展示模型后等待用户选择。
 - 自动路由统一优先 Images：文生图先 `/v1/images/generations`，图生图先 `/v1/images/edits`，失败后再尝试 `/v1/chat/completions`。
 - 支持用户上传参考图，也支持按 Codex 任务复用最近一次成功图片继续修改。
+- 编辑时清理明确的对话包装，仅发送本次修改要求；检查参考图尺寸和体积，必要时生成上传副本，保留原图与用户确认的输出分辨率。
 - 支持 URL、Base64、data URL 和 Chat 消息图片等常见返回格式。
 - 默认使用保守尺寸，并对 2K、4K 等实验尺寸执行确认和结果尺寸检查。
 - 将结果保存为本地图片，并记录实际使用的模型、端点和像素尺寸。
@@ -50,7 +51,7 @@ cp -R skills/keylink-image/. "$skill_dir/"
 sh "$skill_dir/scripts/keylink-image.sh" --help
 ```
 
-建议安装 Pillow，便于显示 4K 大图的独立预览。虚拟环境避免修改 macOS 系统 Python：
+建议安装 Pillow，用于参考图检查、压缩及 4K 大图的独立预览。需要规范化的大参考图在缺少 Pillow 时会停止发送。虚拟环境避免修改 macOS 系统 Python：
 
 ```sh
 python3 -m venv "$skill_dir/.venv"
@@ -61,7 +62,7 @@ python3 -m venv "$skill_dir/.venv"
 
 ### Windows
 
-安装相同的 Skill 目录后，通过 `scripts/keylink-image.ps1` 启动。它会优先寻找 Codex 内置 Python，再检查 PATH 中的 Python。核心程序需要 Python 3.11 或更新版本，Pillow 用于可选的大图预览。
+安装相同的 Skill 目录后，通过 `scripts/keylink-image.ps1` 启动。它会优先寻找 Codex 内置 Python，再检查 PATH 中的 Python。核心程序需要 Python 3.11 或更新版本；参考图规范化需要在该启动器实际使用的 Python 环境安装 Pillow，Pillow 也用于大图预览。
 
 ## 凭据
 
@@ -152,6 +153,14 @@ sh "$skill_dir/scripts/keylink-image.sh" last --thread-id "<原任务 ID>"
 ```
 
 Windows 使用 `keylink-image.ps1` 并传入相同参数。恢复不查询模型、不需要凭据、不重新调用生图 API。大图可能触发 Codex 预览的 `Invalid padding` 错误；独立 JPEG 预览用于显示，完整 PNG 原图保持不变。没有 Pillow 时仍返回原图链接。
+
+## 编辑请求与错误诊断
+
+- `413 Request body is too large`：先规范化参考图；默认上传副本最长边 2048、单张不超过 2 MiB、合计不超过 3 MiB，完整请求体不超过 9 MiB（包括 Chat 中两份 Base64）。这些是客户端保守预算；如果模型目录公布了更低的参考图限制，按更低值执行。未公布限制的渠道仍可能返回 413，不能保证任意渠道都接受。
+- `400 images[].image_url is required`：保留原先兼容的字符串格式；只有明确的 400/422 字段校验错误才在同一个 Chat 端点改用 `{ "image_url": { "url": "..." } }` 重试一次。标准 `messages[].content[].image_url` 始终保留，模型和输出尺寸不变。
+- 编辑 prompt 会提取明确包装中的本轮用户要求。清理后仍有歧义或超过 4000 字符时，先由 Codex 精简，再发请求；不盲目截断，也不删除用户指定的画面文字。
+- `reference_images` 记录原始/上传尺寸和字节数；`prompt_info` 记录提示词长度；`request_attempts` 记录每次 POST 的请求体字节数、起始时间、耗时及 HTTP 状态。后台任务保存稳定参考图副本。
+- HTTP/API 错误、连接中断、200 无图片、图片下载/解码失败分别报告。支持更多嵌套 URL/Base64/Chat/Gemini 图片结构；不再仅凭响应的 `image/*` 类型就把非图片内容当成成功结果。
 
 ## 测试
 

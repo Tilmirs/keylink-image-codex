@@ -327,7 +327,11 @@ class KeylinkImageTests(unittest.TestCase):
             )
             self.assertEqual(edited.returncode, 0, edited.stdout + edited.stderr)
             self.assertEqual(edit_result["references"], [original])
-            self.assertIn(raw.getvalue(), server.requests[0]["body"])
+            self.assertEqual(Path(original).read_bytes(), raw.getvalue())
+            reference = edit_result["reference_images"][0]
+            self.assertNotEqual(reference["request_path"], result["images"][0]["display_path"])
+            self.assertLessEqual(max(reference["prepared_dimensions"]), 2048)
+            self.assertIn(Path(reference["request_path"]).read_bytes(), server.requests[0]["body"])
 
     def test_missing_pillow_keeps_original_deliverable(self) -> None:
         saved = [{"path": str(Path("original.png").resolve()), "bytes": 12000000,

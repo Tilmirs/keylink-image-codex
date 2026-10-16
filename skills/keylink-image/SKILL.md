@@ -15,6 +15,10 @@ This is a standalone Codex skill. Resolve paths relative to the directory contai
 4. Pass explicit uploads with one `--image <path>` per image. Uploaded images take priority over `--use-last` inside the client.
 5. Preserve the user's model ID exactly. Model IDs are pass-through values, including `gpt-image-2.5`, `gpt-image-2.5-sunburst`, and `gpt-image-2.5-flare`. Treat variants as separate catalog choices; never strip their suffixes or substitute the base model during generation, editing, or fallback.
 
+For edits, compose a concise prompt from the current requested changes, required on-image text, and preservation constraints. Exclude chat history, system/tool instructions, logs, command examples, and embedded Base64. The client can unwrap explicit transcript/JSON/context wrappers; it cannot reliably summarize arbitrary prose. If cleanup rejects an ambiguous or overlong prompt, rewrite only the current edit instructions without dropping requested text or constraints, then retry. Do not truncate the prompt to fit.
+
+The client inspects reference image bytes and dimensions before sending either endpoint. It creates upload copies when needed and snapshots all references for detached jobs. Pass original uploaded/saved image paths; never substitute display previews. Pillow is required for resizing, compression, orientation correction, or unsupported input formats. If unavailable and a reference needs conversion, install it into the launcher's Python environment before retrying. Explain normalization using `reference_images` and warnings; requested output pixels stay unchanged. Read [references/routing.md](references/routing.md) for client budgets and published input limits.
+
 ## Choose model, size, and endpoint
 
 - Before every generation or edit, run `models`. It calls `GET /v1/models`, saves a one-use selection token for the current Codex task, and reports server-published sizes.
@@ -74,6 +78,7 @@ The latest successful image is stored under `.keylink-image/threads/<thread-id>/
 - If `view_image` fails with `invalid base64`, `Invalid padding`, or an oversized payload, use `display_path`. A preview error does not mean generation failed; still return the saved original link, without sending a new image request.
 - Include the model, endpoint actually used, requested size, and detected pixel size when available.
 - If both automatic endpoints fail, summarize both errors and ask whether to switch models. Do not switch models before the user agrees.
+- Distinguish HTTP/API errors (including 400/413), connection failures, a successful response without an image, and a returned image that failed to download/decode. Inspect `attempts`, `request_attempts`, and `prompt_info`; do not describe an HTTP/API rejection as a missing image link. A client upload budget reduces oversized requests but cannot guarantee acceptance by an undocumented channel limit.
 - If the user explicitly fixed an endpoint, report that endpoint's failure without trying another one.
 
 ## Recover a missing display
