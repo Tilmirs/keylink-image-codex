@@ -82,10 +82,35 @@ class CredentialConfirmationRequired(ClientError):
                 "then retry with --confirm-codex-auth."
             ),
         }
+        context = (
+            "CCSwitch is running but has no usable Keylink provider key. "
+            if ccswitch_running else "CCSwitch is not detected as running. "
+        )
         super().__init__(
-            "CCSwitch is not detected as running. A credential was found in the "
-            "Codex/Codex++ configuration, but it may be an OpenAI account credential. "
+            context + "No Codex account login was detected. An API key was found in the "
+            "Codex/Codex++ configuration or OPENAI_API_KEY. "
             "Confirm that it is a Keylink API key before using it."
+        )
+
+
+class CodexAccountCredentialError(ClientError):
+    """Account sign-in cannot supply a third-party API key."""
+
+    def __init__(self, *, ccswitch_running: bool) -> None:
+        self.payload = {
+            "codex_account_detected": True,
+            "manual_key_required": True,
+            "ccswitch_running": ccswitch_running,
+        }
+        context = (
+            "CCSwitch is running but no usable Keylink provider key was found. "
+            if ccswitch_running else "CCSwitch is not running. "
+        )
+        super().__init__(
+            "Codex/Codex++ account login detected. " + context
+            + "Manually configure the Keylink provider in CCSwitch and keep it running, "
+            "or set KEYLINK_API_KEY. Account auth.json and OPENAI_API_KEY will not be used; "
+            "--confirm-codex-auth cannot override account login."
         )
 
 
@@ -108,6 +133,9 @@ class CCSwitchState:
     provider_base_urls: list[str] | None = None
     api_key: str | None = None
     running: bool | None = None
+    credential_source: str = "ccswitch-current-provider"
+    credential_error: str | None = None
+    aggregation: bool = False
 
     def __post_init__(self) -> None:
         if self.provider_base_urls is None:
@@ -260,22 +288,61 @@ def discover_codex_credentials() -> list[tuple[Path, str]]:
         if not path.is_file():
             continue
         data = read_codex_config(path)
-        key = recursive_lookup(
-            data, {"OPENAI_API_KEY", "KEYLINK_API_KEY", "API_KEY", "APIKEY"}
-        )
+        key = usable_api_key(data)
         if key:
             results.append((path.resolve(), key))
     return results
 
 
-def discover_codex_api_key(*, confirm: bool = False) -> tuple[str | None, str | None]:
+def has_codex_account_login(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    mode = str(data.get("auth_mode", "")).casefold().replace("_", "")
+    if mode.startswith("chatgpt"):
+        return True
+    tokens = data.get("tokens")
+    if isinstance(tokens, dict) and any(
+        isinstance(tokens.get(key), str) and tokens[key].strip()
+        for key in ("access_token", "refresh_token", "id_token")
+    ):
+        return True
+    return any(has_codex_account_login(value) for value in data.values() if isinstance(value, dict))
+
+
+def discover_codex_account_login() -> bool:
+    # Inspect only login markers, never turn access/refresh tokens into API keys.
+    return any(
+        has_codex_account_login(read_codex_config(path))
+        for path in codex_credential_paths() if path.is_file()
+    )
+
+
+def usable_api_key(data: Any) -> str | None:
+    if not isinstance(data, dict) or has_codex_account_login(data):
+        return None
+    accepted = {"OPENAI_API_KEY", "KEYLINK_API_KEY", "API_KEY", "APIKEY"}
+    for name, value in data.items():
+        if name.upper() in accepted and isinstance(value, str):
+            value = value.strip()
+            if value and value.upper() != "PROXY_MANAGED":
+                return value
+    for value in data.values():
+        found = usable_api_key(value)
+        if found:
+            return found
+    return None
+
+
+def discover_codex_api_key(
+    *, confirm: bool = False, ccswitch_running: bool = False,
+) -> tuple[str | None, str | None]:
     credentials = discover_codex_credentials()
     if not credentials:
         return None, None
     path, key = credentials[0]
     if not confirm:
         raise CredentialConfirmationRequired(
-            [str(item[0]) for item in credentials], ccswitch_running=False
+            [str(item[0]) for item in credentials], ccswitch_running=ccswitch_running
         )
     label = "codex++-config" if "++" in str(path) or "plus" in str(path).lower() else "codex-auth"
     return key, label
@@ -315,9 +382,33 @@ def ccswitch_process_is_running() -> bool:
         return False
 
 
-def discover_ccswitch_state() -> CCSwitchState:
+def ccswitch_rows(connection: sqlite3.Connection, sql: str, args: tuple = ()) -> list[dict]:
+    # Optional tables/columns differ across versions. Failure in proxy discovery
+    # must not prevent reading provider credentials from an older database.
+    try:
+        return [dict(row) for row in connection.execute(sql, args).fetchall()]
+    except sqlite3.Error:
+        return []
+
+
+def json_mapping(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (ValueError, TypeError):
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def discover_ccswitch_state(base_url: str = DEFAULT_BASE_URL) -> CCSwitchState:
     state = CCSwitchState()
-    db_path = user_home() / ".cc-switch" / "cc-switch.db"
+    directory = user_home() / ".cc-switch"
+    live = json_mapping(read_codex_config(directory / "live-state.json"))
+    live = json_mapping(json_mapping(live.get("apps")).get("codex"))
+    device_settings = json_mapping(read_codex_config(directory / "settings.json"))
+    stack = json_mapping(live.get("stack"))
+    state.aggregation = live.get("mode") == "proxy" and stack.get("enabled") is True
+    db_path = directory / "cc-switch.db"
     if db_path.is_file():
         connection: sqlite3.Connection | None = None
         try:
@@ -325,46 +416,81 @@ def discover_ccswitch_state() -> CCSwitchState:
             connection = sqlite3.connect(uri, uri=True, timeout=1)
             connection.row_factory = sqlite3.Row
 
-            proxy = connection.execute(
-                "SELECT proxy_enabled, listen_address, listen_port, enabled "
+            proxies = ccswitch_rows(connection,
+                "SELECT * "
                 "FROM proxy_config WHERE app_type = 'codex'"
-            ).fetchone()
-            if proxy and (bool(proxy["proxy_enabled"]) or bool(proxy["enabled"])):
-                host = str(proxy["listen_address"] or "127.0.0.1")
-                port = int(proxy["listen_port"] or 15721)
+            )
+            proxy = proxies[0] if proxies else {}
+            if proxy.get("proxy_enabled") or proxy.get("enabled"):
+                host = str(proxy.get("listen_address") or "127.0.0.1")
+                try:
+                    port = int(proxy.get("listen_port") or 15721)
+                except (TypeError, ValueError):
+                    port = 15721
+                if host in {"0.0.0.0", "::"}:
+                    host = "127.0.0.1"
+                elif ":" in host and not host.startswith("["):
+                    host = f"[{host}]"
                 state.proxy_base_url = f"http://{host}:{port}"
 
-            provider = connection.execute(
-                "SELECT id, settings_config, website_url FROM providers "
-                "WHERE app_type = 'codex' AND is_current = 1 "
-                "ORDER BY sort_index LIMIT 1"
-            ).fetchone()
-            if provider:
-                endpoints = connection.execute(
-                    "SELECT url FROM provider_endpoints "
-                    "WHERE app_type = 'codex' AND provider_id = ? ORDER BY id",
-                    (provider["id"],),
-                ).fetchall()
-                for row in endpoints:
-                    value = row["url"]
-                    if isinstance(value, str) and value.strip():
-                        state.provider_base_urls.append(value.strip())
-
-                website_url = provider["website_url"]
-                if isinstance(website_url, str) and website_url.strip():
-                    state.provider_base_urls.append(website_url.strip())
-
-                try:
-                    settings = json.loads(provider["settings_config"] or "{}")
-                except json.JSONDecodeError:
-                    settings = {}
-                if not isinstance(settings, dict):
-                    settings = {}
-                provider_url = base_url_from_codex_config(settings.get("config"))
+            providers = ccswitch_rows(connection, "SELECT * FROM providers WHERE app_type = 'codex'")
+            current_id = (
+                live.get("proxy_route") if live.get("mode") == "proxy"
+                else device_settings.get("currentProviderCodex")
+            )
+            if not current_id:
+                current_id = device_settings.get("currentProviderCodex")
+            if not current_id:
+                current = sorted(
+                    (p for p in providers if p.get("is_current")),
+                    key=lambda p: (p.get("sort_index") or 0, str(p.get("id", ""))),
+                )
+                current_id = current[0].get("id") if current else None
+            members = stack.get("members")
+            member_ids = {m for m in members if isinstance(m, str)} if isinstance(members, list) else set()
+            candidates: list[tuple[str, str, list[str]]] = []
+            for provider in providers:
+                provider_id = provider.get("id")
+                if provider_id != current_id and not (state.aggregation and provider_id in member_ids):
+                    continue
+                settings = json_mapping(provider.get("settings_config"))
+                key = usable_api_key(settings)
+                if not key:
+                    continue
+                endpoints = ccswitch_rows(connection,
+                    "SELECT url FROM provider_endpoints WHERE app_type = 'codex' AND provider_id = ?",
+                    (provider_id,),
+                )
+                urls = [row["url"].strip() for row in endpoints if isinstance(row.get("url"), str) and row["url"].strip()]
+                provider_url = base_url_from_codex_config(settings.get("config")) or base_url_from_codex_config(settings)
                 if provider_url:
-                    state.provider_base_urls.insert(0, provider_url)
-                state.api_key = recursive_lookup(
-                    settings, {"OPENAI_API_KEY", "KEYLINK_API_KEY", "API_KEY", "APIKEY"}
+                    urls.insert(0, provider_url)
+                website = provider.get("website_url")
+                remote_hosts = {normalized_host(url) for url in urls if normalized_host(url) and not is_loopback(url)}
+                if not remote_hosts and isinstance(website, str) and website.strip():
+                    remote_hosts.add(normalized_host(website))
+                if isinstance(website, str) and website.strip():
+                    urls.append(website.strip())
+                target_match = normalized_host(base_url) in remote_hosts
+                # Legacy selected providers may only have a local forwarding URL.
+                legacy_local = (
+                    not state.aggregation and not remote_hosts and provider_id == current_id
+                    and normalized_host(base_url) == normalized_host(DEFAULT_BASE_URL)
+                )
+                if target_match or legacy_local:
+                    candidates.append((provider_id, key, urls))
+            selected = next((p for p in candidates if p[0] == current_id), None)
+            if selected is None and len({p[1] for p in candidates}) == 1:
+                selected = candidates[0]
+            if selected:
+                state.api_key = selected[1]
+                state.provider_base_urls = selected[2]
+                if state.aggregation:
+                    state.credential_source = "ccswitch-aggregation-provider"
+            elif candidates:
+                state.credential_error = (
+                    "Multiple CCSwitch aggregation members match the Keylink API host with different keys. "
+                    "Select the intended Keylink provider as the CCSwitch default or set KEYLINK_API_KEY."
                 )
         except (sqlite3.Error, OSError, ValueError):
             pass
@@ -409,16 +535,13 @@ def endpoint_url(base_url: str, endpoint_path: str) -> str:
 
 
 def discover_base_url(explicit: str | None) -> tuple[str, str, CCSwitchState]:
-    ccswitch = discover_ccswitch_state()
     if explicit:
-        return normalize_base_url(explicit), "argument", ccswitch
-
-    value = os.environ.get("KEYLINK_BASE_URL")
-    if value:
-        return normalize_base_url(value), "environment:KEYLINK_BASE_URL", ccswitch
-
-    # Codex/CCSwitch endpoints may only support text or Responses traffic.
-    return normalize_base_url(DEFAULT_BASE_URL), "default", ccswitch
+        base_url, source = normalize_base_url(explicit), "argument"
+    elif os.environ.get("KEYLINK_BASE_URL"):
+        base_url, source = normalize_base_url(os.environ["KEYLINK_BASE_URL"]), "environment:KEYLINK_BASE_URL"
+    else:
+        base_url, source = DEFAULT_BASE_URL, "default"
+    return base_url, source, discover_ccswitch_state(base_url)
 
 
 def normalized_host(url: str) -> str:
@@ -437,14 +560,17 @@ def discover_api_key(
     *, confirm_codex_auth: bool = False,
 ) -> tuple[str | None, str | None]:
     value = os.environ.get("KEYLINK_API_KEY")
-    if value:
-        return value, "environment:KEYLINK_API_KEY"
+    if value and value.strip():
+        if value.strip().upper() == "PROXY_MANAGED":
+            raise ClientError("KEYLINK_API_KEY contains a CCSwitch placeholder. Configure a real Keylink API key.")
+        return value.strip(), "environment:KEYLINK_API_KEY"
 
-    # A running CCSwitch is an explicit local credential selection. Its current
-    # provider may point at a local proxy, so host matching cannot decide whether
-    # the selected key is intended for the direct Keylink request.
+    # Discovery resolves the active provider/member for this API host. A working
+    # CCSwitch credential takes priority without reading account login files.
+    if ccswitch.running and ccswitch.credential_error:
+        raise ClientError(ccswitch.credential_error)
     if ccswitch.running and ccswitch.api_key:
-        return ccswitch.api_key, "ccswitch-current-provider"
+        return ccswitch.api_key, ccswitch.credential_source
 
     ccswitch_hosts = {
         normalized_host(value) for value in ccswitch.provider_base_urls if value
@@ -457,18 +583,20 @@ def discover_api_key(
     if may_use_configured_ccswitch_key and ccswitch.api_key and ccswitch.running is not False:
         return ccswitch.api_key, "ccswitch-current-provider"
 
-    if ccswitch.running:
-        return None, None
+    if discover_codex_account_login():
+        raise CodexAccountCredentialError(ccswitch_running=bool(ccswitch.running))
 
-    key, source = discover_codex_api_key(confirm=confirm_codex_auth)
+    key, source = discover_codex_api_key(
+        confirm=confirm_codex_auth, ccswitch_running=bool(ccswitch.running),
+    )
     if key:
         return key, source
 
-    value = os.environ.get("OPENAI_API_KEY")
+    value = usable_api_key({"OPENAI_API_KEY": os.environ.get("OPENAI_API_KEY")})
     if value:
         if not confirm_codex_auth:
             raise CredentialConfirmationRequired(
-                ["environment:OPENAI_API_KEY"], ccswitch_running=False
+                ["environment:OPENAI_API_KEY"], ccswitch_running=bool(ccswitch.running)
             )
         return value, "environment:OPENAI_API_KEY"
 
@@ -1709,8 +1837,10 @@ def command_models(args: argparse.Namespace) -> int:
     if not api_key and not is_loopback(base_url):
         if ccswitch.running:
             raise ClientError(
-                "CCSwitch is running, but its current Codex Provider has no readable API key. "
-                "Configure the Keylink key in CCSwitch; auth.json was not inspected."
+                "CCSwitch is running, but no usable Keylink provider key or API-key-only "
+                "Codex/Codex++ credential was found. Configure a Keylink provider "
+                "(add it to aggregation if enabled) or set KEYLINK_API_KEY. "
+                "PROXY_MANAGED and account tokens are not API keys."
             )
         raise ClientError(
             "No API credential was found. Start CCSwitch with the Keylink Provider, "
@@ -1756,8 +1886,10 @@ def command_run(args: argparse.Namespace) -> int:
     if not api_key and not is_loopback(base_url):
         if ccswitch.running:
             raise ClientError(
-                "CCSwitch is running, but its current Codex Provider has no readable API key. "
-                "Configure the Keylink key in CCSwitch; auth.json was not inspected."
+                "CCSwitch is running, but no usable Keylink provider key or API-key-only "
+                "Codex/Codex++ credential was found. Configure a Keylink provider "
+                "(add it to aggregation if enabled) or set KEYLINK_API_KEY. "
+                "PROXY_MANAGED and account tokens are not API keys."
             )
         raise ClientError(
             "No API credential was found. Start CCSwitch with the Keylink Provider, "
@@ -1976,7 +2108,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         validate_args(args)
         return int(args.handler(args))
-    except CredentialConfirmationRequired as error:
+    except (CredentialConfirmationRequired, CodexAccountCredentialError) as error:
         payload = {"status": "error", "error": str(error)}
         payload.update(error.payload)
         emit(payload)
@@ -1991,4 +2123,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

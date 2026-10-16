@@ -120,7 +120,8 @@ class KeylinkImageTests(unittest.TestCase):
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["CODEX_THREAD_ID"] = thread_id
-        env.pop("KEYLINK_API_KEY", None)
+        # Never read/send the developer's real CCSwitch or Codex credentials.
+        env["KEYLINK_API_KEY"] = "local-test-key"
         env.pop("OPENAI_API_KEY", None)
         env.pop("KEYLINK_IMAGE_STATE_DIR", None)
         base_url = f"http://127.0.0.1:{server.server_address[1]}"
@@ -165,7 +166,14 @@ class KeylinkImageTests(unittest.TestCase):
                 "    return popen(*args, **kwargs)",
                 "subprocess.Popen = deny_breakaway",
                 "sys.argv = sys.argv[1:]",
-                "runpy.run_path(sys.argv[0], run_name='__main__')",
+                "namespace = runpy.run_path(sys.argv[0])",
+                "create_task = namespace['create_windows_worker_task']",
+                "def create_fixture_task(command, cwd, job_id):",
+                # Task Scheduler does not inherit this test process's environment.
+                "    bootstrap = \"import os,runpy,sys; os.environ['KEYLINK_API_KEY']='local-test-key'; sys.argv=sys.argv[1:]; runpy.run_path(sys.argv[0],run_name='__main__')\"",
+                "    return create_task([*command[:3], '-c', bootstrap, *command[3:]], cwd, job_id)",
+                "namespace['command_start'].__globals__['create_windows_worker_task'] = create_fixture_task",
+                "sys.exit(namespace['main']())",
             ]), str(CLIENT)]
         completed = subprocess.run(
             [
@@ -951,7 +959,9 @@ class KeylinkImageTests(unittest.TestCase):
         ccswitch = client_module.CCSwitchState(
             provider_base_urls=["https://keylinkclub.com"], api_key="test-key-only"
         )
-        with mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            client_module, "discover_codex_account_login", return_value=False
+        ), mock.patch.object(client_module, "discover_codex_credentials", return_value=[]):
             self.assertEqual(client_module.discover_api_key(
                 "https://keylinkclub.com", "default", ccswitch
             ), ("test-key-only", "ccswitch-current-provider"))
@@ -1013,6 +1023,8 @@ class KeylinkImageTests(unittest.TestCase):
         credentials = [(Path("C:/Users/example/.codex++/auth.json"), "codex-key")]
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             client_module, "discover_codex_credentials", return_value=credentials
+        ), mock.patch.object(
+            client_module, "discover_codex_account_login", return_value=False
         ):
             with self.assertRaises(client_module.CredentialConfirmationRequired) as raised:
                 client_module.discover_api_key(
@@ -1041,7 +1053,7 @@ class KeylinkImageTests(unittest.TestCase):
             )
             with mock.patch.dict(os.environ, {
                 "CODEX_PLUS_CONFIG": str(config),
-            }, clear=True):
+            }, clear=True), mock.patch.object(client_module, "user_home", return_value=Path(temporary)):
                 credentials = client_module.discover_codex_credentials()
             self.assertEqual(credentials, [(config.resolve(), "private-fixture-key")])
 
@@ -1132,7 +1144,7 @@ class KeylinkImageTests(unittest.TestCase):
             )
             env = os.environ.copy()
             env["PYTHONUTF8"] = "1"
-            env.pop("KEYLINK_API_KEY", None)
+            env["KEYLINK_API_KEY"] = "local-test-key"
             env.pop("OPENAI_API_KEY", None)
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
             discovery = subprocess.run([
@@ -1178,7 +1190,8 @@ class KeylinkImageTests(unittest.TestCase):
             env = os.environ.copy()
             env.update(KEYLINK_PYTHON=sys.executable, CODEX_THREAD_ID="shell-test",
                        NO_PROXY="127.0.0.1,localhost", no_proxy="127.0.0.1,localhost")
-            for name in ("KEYLINK_API_KEY", "OPENAI_API_KEY", "KEYLINK_IMAGE_STATE_DIR"):
+            env["KEYLINK_API_KEY"] = "local-test-key"
+            for name in ("OPENAI_API_KEY", "KEYLINK_IMAGE_STATE_DIR"):
                 env.pop(name, None)
             server.routes[("GET", "/v1/models")] = json_response(
                 {"data": [{"id": "gpt-image-2"}]}
@@ -1282,4 +1295,3 @@ class KeylinkImageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

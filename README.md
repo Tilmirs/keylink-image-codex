@@ -68,10 +68,18 @@ python3 -m venv "$skill_dir/.venv"
 Skill 不会输出密钥，按以下规则选择：
 
 1. 明确配置的 `KEYLINK_API_KEY` 直接作为 Keylink 密钥使用。
-2. 检测 CCSwitch 是否真正运行。如果正在运行，只使用 CCSwitch 当前 Codex Provider 的密钥，不检查 `auth.json`。
-3. 如果 CCSwitch 没有运行，再检查 Codex 和 Codex++ 的常见 `auth.json`、`config.json`、`config.toml` 路径，但发现的密钥不会立即发送；Skill 会提示用户确认“这个凭据是否是 Keylink 的 Key”。用户确认后才继续，用户否认或不确定则提示启动 CCSwitch 并配置 Keylink Provider，或设置 `KEYLINK_API_KEY`。
+2. 检测 CCSwitch 是否真正运行。兼容旧版当前 Provider、新版路由模式和聚合模式；聚合模式从当前成员中查找 API 地址匹配的 Keylink Provider，不把默认的 OpenAI 官方账号当作 Keylink。如果有多个不同的 Keylink 密钥且默认项无法确定选择，会要求用户选择 Keylink 默认 Provider 或手动设置 `KEYLINK_API_KEY`。
+3. CCSwitch 没有可用密钥时，检查 Codex/Codex++ 是否保存了账号登录状态。**已登录账号：不从 `auth.json` 或 `OPENAI_API_KEY` 兜底**；提示用户手动配置 Keylink 密钥，启动 CCSwitch 并选择 Keylink（聚合模式需加入成员），或设置 `KEYLINK_API_KEY`。`--confirm-codex-auth` 不能绕过账号登录保护。
+4. **未检测到账号登录：** 才检查 Codex/Codex++ 的 API Key 配置。无论 CCSwitch 未运行还是运行中但未找到密钥，都可以进入这个兜底。发现候选后先询问“这个凭据是否是 Keylink 的 Key”，用户确认后使用 `--confirm-codex-auth` 继续；否认或不确定则要求手动配置。
 
-`OPENAI_API_KEY` 和 Codex `auth.json` 一样，在 CCSwitch 未运行时需要用户确认，因为其中可能是用户自己的 OpenAI 账号凭据。CCSwitch 正在运行但当前 Provider 没有可读密钥时直接报配置错误，不回退到 `auth.json`。CCSwitch 只提供密钥，图片请求仍直连 `https://keylinkclub.com`。
+CCSwitch 只提供真实供应商密钥，图片请求仍直连 `https://keylinkclub.com`。新版写入客户端的 `PROXY_MANAGED` 是本地路由占位值，不能用于直连；OAuth 登录令牌也不会作为 API Key 使用。Skill 只读取 CCSwitch 和 Codex 配置，不覆盖账号登录文件。
+
+| 登录状态 | CCSwitch 状态 | 处理方式（未显式设置 `KEYLINK_API_KEY` 时） |
+| --- | --- | --- |
+| 已登录 Codex 账号 | 运行且找到 Keylink 密钥 | 使用 CCSwitch 密钥 |
+| 已登录 Codex 账号 | 未运行或找不到 Keylink 密钥 | 报错并提示手动配置，不使用 `auth.json` 兜底 |
+| 未登录 Codex 账号 | 运行且找到 Keylink 密钥 | 优先使用 CCSwitch 密钥 |
+| 未登录 Codex 账号 | 未运行或找不到 Keylink 密钥 | 检查 API-key-only 配置，用户确认属于 Keylink 后使用 |
 
 Codex++ 可通过 `CODEX_PLUS_HOME`、`CODEXPP_HOME` 或 `KEYLINK_CODEX_CONFIG_DIR` 指定配置目录；也支持 `CODEX_PLUS_CONFIG`、`CODEXPP_CONFIG` 和 `KEYLINK_CODEX_AUTH_FILE` 指定文件。不要把密钥写进聊天、命令参数或提交到仓库。
 
@@ -150,4 +158,3 @@ python -X utf8 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 macOS 也可使用 `python3` 或虚拟环境内的 Python。GitHub Actions 在 Windows 和 macOS 上运行测试；测试使用本地模拟服务，不消耗 Keylink 生图额度。
-
