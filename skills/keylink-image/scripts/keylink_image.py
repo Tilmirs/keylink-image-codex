@@ -114,6 +114,26 @@ class CodexAccountCredentialError(ClientError):
         )
 
 
+class CCSwitchDetectionRequired(ClientError):
+    """Sandbox restrictions are not evidence that CCSwitch is stopped."""
+
+    def __init__(self) -> None:
+        self.payload = {
+            "ccswitch_detection_required": True,
+            "ccswitch_running": None,
+            "requires_host_execution": True,
+            "recommended_action": (
+                "Retry the same command with host process/network permissions through the "
+                "client's approval flow. Do not change credentials or assume CCSwitch is stopped."
+            ),
+        }
+        super().__init__(
+            "CCSwitch running state could not be checked: process enumeration or the local "
+            "listener probe was denied, unavailable, or timed out. Retry with approved host "
+            "execution; no credential was selected and no API request was sent."
+        )
+
+
 class EndpointError(ClientError):
     def __init__(self, endpoint: str, message: str):
         super().__init__(message)
@@ -348,7 +368,7 @@ def discover_codex_api_key(
     return key, label
 
 
-def local_endpoint_is_running(url: str | None) -> bool:
+def local_endpoint_is_running(url: str | None) -> bool | None:
     if not url:
         return False
     try:
@@ -357,11 +377,17 @@ def local_endpoint_is_running(url: str | None) -> bool:
             return False
         with socket.create_connection((parsed.hostname, parsed.port or 80), timeout=0.25):
             return True
-    except (OSError, ValueError):
+    except ValueError:
         return False
+    except OSError as error:
+        if error.errno == errno.ECONNREFUSED or getattr(error, "winerror", None) == 10061:
+            return False
+        # Access denied (including WSAEACCES/10013) and timeouts cannot prove
+        # that the listener is absent. Keep the state unknown for an approved retry.
+        return None
 
 
-def ccswitch_process_is_running() -> bool:
+def ccswitch_process_is_running() -> bool | None:
     try:
         if os.name == "nt":
             completed = subprocess.run(
@@ -369,6 +395,8 @@ def ccswitch_process_is_running() -> bool:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, encoding="mbcs", errors="replace", timeout=1, check=False,
             )
+            if completed.returncode != 0:
+                return None
             text = completed.stdout.casefold()
         else:
             completed = subprocess.run(
@@ -376,10 +404,14 @@ def ccswitch_process_is_running() -> bool:
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                 text=True, encoding="utf-8", errors="replace", timeout=1, check=False,
             )
+            if completed.returncode == 1:  # pgrep: successful query, no matches
+                return False
+            if completed.returncode != 0:
+                return None
             text = completed.stdout.casefold()
         return any(name in text for name in ("cc-switch", "ccswitch", "cc switch"))
     except (OSError, subprocess.SubprocessError):
-        return False
+        return None
 
 
 def ccswitch_rows(connection: sqlite3.Connection, sql: str, args: tuple = ()) -> list[dict]:
@@ -499,7 +531,14 @@ def discover_ccswitch_state(base_url: str = DEFAULT_BASE_URL) -> CCSwitchState:
                 connection.close()
 
     state.provider_base_urls = list(dict.fromkeys(state.provider_base_urls))
-    state.running = local_endpoint_is_running(state.proxy_base_url) or ccswitch_process_is_running()
+    listener = local_endpoint_is_running(state.proxy_base_url)
+    process = ccswitch_process_is_running() if listener is not True else None
+    if listener is True or process is True:
+        state.running = True
+    elif listener is None or process is None:
+        state.running = None
+    else:
+        state.running = False
     return state
 
 
@@ -565,23 +604,22 @@ def discover_api_key(
             raise ClientError("KEYLINK_API_KEY contains a CCSwitch placeholder. Configure a real Keylink API key.")
         return value.strip(), "environment:KEYLINK_API_KEY"
 
+    if ccswitch.running is None:
+        raise CCSwitchDetectionRequired()
+
     # Discovery resolves the active provider/member for this API host. A working
     # CCSwitch credential takes priority without reading account login files.
     if ccswitch.running and ccswitch.credential_error:
         raise ClientError(ccswitch.credential_error)
-    if ccswitch.running and ccswitch.api_key:
-        return ccswitch.api_key, ccswitch.credential_source
-
-    ccswitch_hosts = {
-        normalized_host(value) for value in ccswitch.provider_base_urls if value
+    provider_hosts = {
+        normalized_host(url) for url in ccswitch.provider_base_urls
+        if normalized_host(url) and not is_loopback(url)
     }
-    may_use_configured_ccswitch_key = (
-        base_source.startswith("ccswitch")
-        or (base_source == "codex-config" and is_loopback(base_url))
-        or normalized_host(base_url) in ccswitch_hosts
+    selected_host_matches = normalized_host(base_url) in provider_hosts or (
+        not provider_hosts and normalized_host(base_url) == normalized_host(DEFAULT_BASE_URL)
     )
-    if may_use_configured_ccswitch_key and ccswitch.api_key and ccswitch.running is not False:
-        return ccswitch.api_key, "ccswitch-current-provider"
+    if ccswitch.running and ccswitch.api_key and selected_host_matches:
+        return ccswitch.api_key, ccswitch.credential_source
 
     if discover_codex_account_login():
         raise CodexAccountCredentialError(ccswitch_running=bool(ccswitch.running))
@@ -2108,7 +2146,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         validate_args(args)
         return int(args.handler(args))
-    except (CredentialConfirmationRequired, CodexAccountCredentialError) as error:
+    except (CredentialConfirmationRequired, CodexAccountCredentialError, CCSwitchDetectionRequired) as error:
         payload = {"status": "error", "error": str(error)}
         payload.update(error.payload)
         emit(payload)

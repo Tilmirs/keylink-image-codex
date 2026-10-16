@@ -957,7 +957,7 @@ class KeylinkImageTests(unittest.TestCase):
 
     def test_keylink_credentials_are_not_reused_for_an_unrelated_host(self) -> None:
         ccswitch = client_module.CCSwitchState(
-            provider_base_urls=["https://keylinkclub.com"], api_key="test-key-only"
+            provider_base_urls=["https://keylinkclub.com"], api_key="test-key-only", running=True
         )
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             client_module, "discover_codex_account_login", return_value=False

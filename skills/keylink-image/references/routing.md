@@ -8,6 +8,8 @@ Credential selection is separate from request routing. An explicit `KEYLINK_API_
 
 If no CCSwitch key is available, check common Codex/Codex++ auth/config locations for account login (`auth_mode` indicating ChatGPT, or populated login token fields). If signed in, stop with `codex_account_detected` and `manual_key_required`: the user must manually configure a Keylink provider in running CCSwitch or set `KEYLINK_API_KEY`. Do not reuse account auth/config keys or `OPENAI_API_KEY`, even with `--confirm-codex-auth`. Preserve account login files.
 
+Process/listener probes use three states. A positive probe confirms running. A successful process query without a match and an absent/refused listener confirm stopped. Permission errors, nonzero `tasklist` failures, failed `pgrep` queries (exit 2+), unavailable commands and timeouts leave the state unknown unless the other probe confirms running. Unknown returns `ccswitch_detection_required` and `requires_host_execution` before selecting any implicit credential. Follow the approved host retry described in `SKILL.md`; never treat unreadable process state as proof that CCSwitch is stopped or running.
+
 If no account login is detected, API-key-only Codex/Codex++ auth/config files and `OPENAI_API_KEY` may be offered as fallback whether CCSwitch is stopped or has no usable key. Return `credential_confirmation_required`, then require confirmation that the candidate belongs to Keylink before retrying with `--confirm-codex-auth`. Reject `PROXY_MANAGED` placeholders and never extract OAuth access, refresh or ID tokens as API keys.
 
 ## Automatic endpoint order

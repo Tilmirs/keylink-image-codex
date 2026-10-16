@@ -74,6 +74,8 @@ Skill 不会输出密钥，按以下规则选择：
 
 CCSwitch 只提供真实供应商密钥，图片请求仍直连 `https://keylinkclub.com`。新版写入客户端的 `PROXY_MANAGED` 是本地路由占位值，不能用于直连；OAuth 登录令牌也不会作为 API Key 使用。Skill 只读取 CCSwitch 和 Codex 配置，不覆盖账号登录文件。
 
+**CCSwitch 已打开却提示未运行：** Codex 沙箱可能禁止查询宿主进程或连接本地监听端口。客户端现在将这种情况报告为 `ccswitch_detection_required` / `requires_host_execution`，并把运行状态标为 `null`（无法确认），不会当作未运行。Skill 会通过客户端的批准流程在宿主环境重试同一条命令；若执行权限仍不可用，会提示在自己的终端执行。无需因此重新配置密钥；也不会仅凭数据库里存在密钥就认定 CCSwitch 正在运行。
+
 | 登录状态 | CCSwitch 状态 | 处理方式（未显式设置 `KEYLINK_API_KEY` 时） |
 | --- | --- | --- |
 | 已登录 Codex 账号 | 运行且找到 Keylink 密钥 | 使用 CCSwitch 密钥 |

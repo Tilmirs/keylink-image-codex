@@ -4,8 +4,11 @@ import contextlib
 import io
 import json
 import os
+import errno
 from pathlib import Path
 import sqlite3
+import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -230,3 +233,75 @@ class CredentialTests(unittest.TestCase):
                 self.assertIn("KEYLINK_API_KEY", result["error"])
                 self.assertNotIn("private-login-token", output.getvalue())
                 self.assertNotIn("stale-auth-key", output.getvalue())
+
+
+class DetectionTests(unittest.TestCase):
+    def test_listener_denied_and_timeout_are_unknown_but_refused_is_stopped(self):
+        for error, expected in ((PermissionError(errno.EACCES, "denied"), None),
+                                 (socket.timeout("timeout"), None),
+                                 (ConnectionRefusedError(errno.ECONNREFUSED, "refused"), False)):
+            with self.subTest(error=type(error).__name__), mock.patch.object(
+                client.socket, "create_connection", side_effect=error
+            ):
+                self.assertIs(client.local_endpoint_is_running("http://localhost:12345"), expected)
+
+    def test_tasklist_failure_is_unknown_not_stopped(self):
+        for code, output, expected in ((1, "", None), (0, '"cc-switch.exe","1"', True),
+                                       (0, '"other.exe","1"', False)):
+            with self.subTest(code=code, expected=expected), mock.patch.object(client.os, "name", "nt"), mock.patch.object(
+                client.subprocess, "run", return_value=subprocess.CompletedProcess([], code, output)
+            ):
+                self.assertIs(client.ccswitch_process_is_running(), expected)
+
+    def test_pgrep_no_match_is_distinct_from_failed_query(self):
+        for code, expected in ((1, False), (2, None)):
+            with self.subTest(code=code), mock.patch.object(client.os, "name", "posix"), mock.patch.object(
+                client.subprocess, "run", return_value=subprocess.CompletedProcess([], code, "")
+            ):
+                self.assertIs(client.ccswitch_process_is_running(), expected)
+
+    def test_process_probe_timeout_or_missing_command_is_unknown(self):
+        for error in (subprocess.TimeoutExpired("tasklist", 1), FileNotFoundError("missing")):
+            with self.subTest(error=type(error).__name__), mock.patch.object(client.subprocess, "run", side_effect=error):
+                self.assertIsNone(client.ccswitch_process_is_running())
+
+    def test_either_positive_probe_proves_running_otherwise_unknown_is_preserved(self):
+        cases = ((True, None, True), (None, True, True), (False, True, True),
+                 (False, False, False), (False, None, None), (None, False, None), (None, None, None))
+        for listener, process, expected in cases:
+            with self.subTest(listener=listener, process=process), mock.patch.object(
+                client, "local_endpoint_is_running", return_value=listener
+            ), mock.patch.object(client, "ccswitch_process_is_running", return_value=process), mock.patch.object(
+                client, "user_home", return_value=Path(__file__).parent / "absent-fixture-home"
+            ):
+                self.assertIs(client.discover_ccswitch_state().running, expected)
+
+    def test_unknown_state_never_reuses_stale_key_or_scans_account(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            client, "discover_codex_account_login", side_effect=AssertionError("No credential fallback")
+        ):
+            for key in (None, "private-stale-key"):
+                state = client.CCSwitchState(running=None, api_key=key, provider_base_urls=[client.DEFAULT_BASE_URL])
+                with self.subTest(has_key=bool(key)), self.assertRaises(client.CCSwitchDetectionRequired):
+                    client.discover_api_key(client.DEFAULT_BASE_URL, "default", state, confirm_codex_auth=True)
+
+    def test_models_returns_host_retry_and_sends_no_request_when_detection_blocked(self):
+        state = client.CCSwitchState(running=None, api_key="private-stale-key")
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
+            client, "discover_base_url", return_value=(client.DEFAULT_BASE_URL, "default", state)
+        ), mock.patch.object(client, "HttpClient") as http:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(client.main(["models"]), 1)
+            http.assert_not_called()
+            result = json.loads(output.getvalue())
+            self.assertTrue(result["ccswitch_detection_required"])
+            self.assertTrue(result["requires_host_execution"])
+            self.assertIsNone(result["ccswitch_running"])
+            self.assertNotIn("private-stale-key", output.getvalue())
+
+    def test_explicit_key_does_not_depend_on_process_permissions(self):
+        with mock.patch.dict(os.environ, {"KEYLINK_API_KEY": "manual-key"}, clear=True):
+            self.assertEqual(client.discover_api_key(
+                client.DEFAULT_BASE_URL, "default", client.CCSwitchState(running=None)
+            ), ("manual-key", "environment:KEYLINK_API_KEY"))
