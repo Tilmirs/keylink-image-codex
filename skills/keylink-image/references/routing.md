@@ -19,6 +19,7 @@ If no account login is detected, API-key-only Codex/Codex++ auth/config files an
 | `gpt-image-2` and `gpt-image-*` | Images Generations, then Chat | Images Edits, then Chat |
 | `gpt-image-2.5`, `gpt-image-2.5-sunburst`, `gpt-image-2.5-flare` | Images Generations, then Chat | Images Edits, then Chat |
 | `gemini-3-pro-image`, `gemini-3.1-flash-image`, and Gemini image IDs | Images Generations, then Chat | Images Edits, then Chat |
+| `gemini-nano-banana-2.1` | Images Generations, then Chat | Images Edits, then Chat |
 | Other pass-through model IDs | Images, then Chat | Images Edits, then Chat |
 
 Automatic fallback occurs for HTTP errors, successful responses with no image, and image download or decoding failures. Both endpoints use the same model ID, cleaned prompt, requested output size, and prepared references. Explicit `images`, `chat`, and custom endpoint modes stay on that endpoint.
@@ -39,9 +40,9 @@ Only the current edit instructions belong in the prompt. The client unwraps expl
 
 Default **client budgets**, not claims about Keylink's model limits:
 
-- At most 16 references, longest edge 2048 pixels, no cropping or upscaling.
-- At most 1 MiB per reference and 1 MiB across all references. Larger references are compressed before either endpoint; the total budget is divided among multiple references. The two Base64 copies in Chat then occupy about 2.67 MiB plus JSON/prompt overhead, rather than about 5.3 MiB for a single 2 MiB source. This cannot guarantee acceptance by a channel with a lower undocumented limit.
-- At most 9 MiB for the encoded request body, including the two Chat Base64 representations and prompt. Oversized bodies stop before networking.
+- At most 15 references, longest edge 2048 pixels, no cropping or upscaling. More than 15 stops before submission without discarding any images.
+- At most 1 MiB per reference, so up to 15 MiB of prepared files. Compliant small files retain their original bytes; the set no longer shares a 1 MiB budget. If the exact model publishes a lower total budget, compress the largest uploads further as needed. A small file may still need normalization for dimensions/orientation/format or to meet that published total. Always encode from the original and keep reference order. Fifteen full-size inputs occupy about 15 MiB in multipart or 40 MiB in the dual-Base64 Chat format, plus fields/prompt overhead; an undocumented channel limit can still cause 413.
+- At most 48 MiB for the encoded request body, including the two Chat Base64 representations and prompt. This client guard accommodates the 15-image policy and is not an advertised server limit. Oversized bodies stop before networking.
 
 The exact selected model's explicit `reference_image_limits` or `input_image_limits`, at the entry root or in `capabilities`, can lower these budgets through integer `max_bytes`, `max_total_bytes`, `max_width`, `max_height`, and `max_images`. Output resolution metadata is never interpreted as a reference limit. When no input limits are published, `reference_limit_source` reports `client-budget`; an undocumented channel may still reject the request with 413.
 
@@ -58,6 +59,10 @@ The conservative size set is:
 - `1024x1024`
 - `1536x1024`
 - `1024x1536`
+
+For editing, omitted `--size` and `--aspect` inherit the original reference dimensions after EXIF orientation, before any upload resizing/compression. This applies to uploads, `--use-last`, and implicit corrections. Explicit output size/aspect overrides inheritance. Mixed reference dimensions or unreadable dimensions require the user to choose an output size. A non-conservative inherited size still stops for confirmation; it is never silently replaced by a conservative size. Detached jobs keep original dimension metadata and use the same output size through endpoint fallback. New text-only generations still default to square.
+
+`size_source` distinguishes original-reference inheritance, explicit size/aspect, and the text-only square default. Each saved image reports `matches_requested_size` when actual dimensions can be read. A mismatch produces a warning even for Images results: save and deliver the actual returned file, report the discrepancy, and avoid local upscaling or an automatic extra generation.
 
 When the user requests higher resolution, fetch the model catalog first. Present the server-published sizes and label `2560x1440` or `3840x2160` as attempts that the channel may reject when they are not published. Confirmation is required before passing a non-conservative size to `start`.
 

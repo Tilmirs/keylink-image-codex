@@ -44,12 +44,16 @@ DEFAULT_MODEL_PRIORITY = (
     "gpt-image-2.5-flare",
     "gemini-3-pro-image",
     "gemini-3.1-flash-image",
+    "gemini-nano-banana-2.1",
 )
 CONSERVATIVE_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 EXPERIMENTAL_SIZES = ("2560x1440", "3840x2160")
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
 DATA_URL_RE = re.compile(
     r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/_-]+(?:\r?\n[A-Za-z0-9+/_-]+)*={0,2})", re.I
+)
+INLINE_DATA_URL_RE = re.compile(
+    r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/_-]+={0,2})", re.I
 )
 MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\((https?://[^)\s]+)\)", re.I)
 HTTP_URL_RE = re.compile(r"https?://[^\s<>\]\[\"']+", re.I)
@@ -71,10 +75,11 @@ EDIT_CONTEXT_LINE_RE = re.compile(
 EDIT_PROMPT_MAX_CHARS = 4000
 REFERENCE_MAX_DIMENSION = 2048
 REFERENCE_MAX_IMAGE_BYTES = 1024 * 1024
-REFERENCE_MAX_TOTAL_BYTES = 1024 * 1024
+REFERENCE_MAX_COUNT = 15
+REFERENCE_MAX_TOTAL_BYTES = REFERENCE_MAX_COUNT * REFERENCE_MAX_IMAGE_BYTES
 REFERENCE_MIN_DIMENSION = 768
-REFERENCE_MAX_COUNT = 16
-REQUEST_MAX_BYTES = 9 * 1024 * 1024
+# Fifteen 1 MiB inputs become about 40 MiB in the dual-Base64 Chat format.
+REQUEST_MAX_BYTES = 48 * 1024 * 1024
 IMAGE_URL_KEYS = {
     "url", "uri", "image_url", "image_uri", "file_url", "fileurl",
     "imageurl", "output_image", "outputimage", "generated_image", "generatedimage", "image",
@@ -101,6 +106,10 @@ class ClientError(RuntimeError):
 
 class RefusalError(ClientError):
     """An explicit provider refusal is not an image result or a retry signal."""
+
+
+class ReferenceBudgetError(ClientError):
+    """A reference cannot reach a byte budget without excessive detail loss."""
 
 
 class CredentialConfirmationRequired(ClientError):
@@ -953,11 +962,11 @@ def parse_size(size: str) -> tuple[int, int]:
     return width, height
 
 
-def choose_size(explicit_size: str | None, aspect: str) -> str:
+def choose_size(explicit_size: str | None, aspect: str | None) -> str:
     if explicit_size:
         width, height = parse_size(explicit_size)
         return f"{width}x{height}"
-    normalized = aspect.lower().replace(" ", "")
+    normalized = (aspect or "square").lower().replace(" ", "")
     if normalized in {"portrait", "vertical", "9:16", "2:3", "3:4"}:
         return "1024x1536"
     if normalized in {"landscape", "horizontal", "16:9", "3:2", "4:3"}:
@@ -1388,8 +1397,7 @@ def prepare_reference_images(
     if len(paths) > max_count:
         raise ClientError(f"Too many reference images ({len(paths)}); current limit is {max_count}. Choose fewer references; none were discarded.")
     total_budget = min(REFERENCE_MAX_TOTAL_BYTES, limits.get("max_total_bytes", REFERENCE_MAX_TOTAL_BYTES))
-    budget = min(REFERENCE_MAX_IMAGE_BYTES, limits.get("max_bytes", REFERENCE_MAX_IMAGE_BYTES),
-                 total_budget // max(1, len(paths)))
+    budget = min(REFERENCE_MAX_IMAGE_BYTES, limits.get("max_bytes", REFERENCE_MAX_IMAGE_BYTES), total_budget)
     bounds = (min(REFERENCE_MAX_DIMENSION, limits.get("max_width", REFERENCE_MAX_DIMENSION)),
               min(REFERENCE_MAX_DIMENSION, limits.get("max_height", REFERENCE_MAX_DIMENSION)))
     prepared: list[Path] = []
@@ -1403,6 +1411,7 @@ def prepare_reference_images(
             mime = detect_mime_type(raw)
             dimensions = detect_dimensions(raw, mime)
             original_dimensions = dimensions
+            oriented_dimensions = dimensions
             original_bytes = len(raw)
             original_raw = raw
             try:
@@ -1427,6 +1436,7 @@ def prepare_reference_images(
                     source.verify()
                 with Image.open(path) as source:
                     orientation = source.getexif().get(274, 1)
+                    oriented_dimensions = (source.height, source.width) if orientation in {5, 6, 7, 8} else source.size
                     needs_change = (mime not in {"image/png", "image/jpeg", "image/webp"}
                                     or source.width > bounds[0] or source.height > bounds[1]
                                     or len(raw) > budget or orientation != 1)
@@ -1451,7 +1461,7 @@ def prepare_reference_images(
                             if len(raw) <= budget:
                                 break
                             if max(picture.size) <= floor:
-                                raise ClientError("References cannot fit the request budget without excessive detail loss. Use fewer/smaller references; no request was sent.")
+                                raise ReferenceBudgetError("References cannot fit the request budget without excessive detail loss. Use fewer/smaller references; no request was sent.")
                             edge = max(floor, int(max(picture.size) * 0.8))
                             picture.thumbnail((edge, edge), Image.Resampling.LANCZOS)
                         dimensions = picture.size
@@ -1470,13 +1480,47 @@ def prepare_reference_images(
                 "source_path": str(path), "request_path": str(target.resolve()),
                 "original_bytes": original_bytes, "prepared_bytes": len(raw),
                 "original_dimensions": list(original_dimensions) if original_dimensions else None,
+                "original_oriented_dimensions": list(oriented_dimensions) if oriented_dimensions else None,
                 "prepared_dimensions": list(dimensions) if dimensions else None,
                 "mime_type": mime, "normalized": changed,
             })
-            if changed:
-                warnings.append(f"Reference {index + 1} normalized for upload: {original_dimensions} / {original_bytes} bytes → {dimensions} / {len(raw)} bytes. Original preserved.")
         except (OSError, ValueError) as error:
             raise ClientError(f"Cannot prepare reference {index + 1}: {error}") from error
+    # Enforce per-image limits first, then reduce the largest uploads only as
+    # needed. Equal shares unnecessarily recompress small images in mixed sets.
+    total = sum(item["prepared_bytes"] for item in items)
+    fair_share = total_budget // max(1, len(paths))
+    for index in sorted(range(len(items)), key=lambda i: items[i]["prepared_bytes"], reverse=True):
+        if total <= total_budget:
+            break
+        previous_size = items[index]["prepared_bytes"]
+        remaining = total_budget - (total - previous_size)
+        targets = [remaining] if remaining > 0 else []
+        if remaining < fair_share:
+            targets.append(fair_share)
+        for target in targets:
+            if target >= previous_size:
+                continue
+            try:
+                # Always encode from the original, never recompress a JPEG copy.
+                reduced = prepare_reference_images(
+                    [paths[index]], destination / str(index + 1) / "total-budget",
+                    {**limits, "max_total_bytes": target}, snapshot=snapshot,
+                )
+            except ReferenceBudgetError:
+                continue
+            prepared[index], items[index] = reduced.paths[0], reduced.items[0]
+            total += items[index]["prepared_bytes"] - previous_size
+            break
+    if total > total_budget:
+        raise ReferenceBudgetError("References cannot fit the total upload budget without excessive detail loss. Use fewer/smaller references; no request was sent.")
+    for index, item in enumerate(items):
+        if item["normalized"]:
+            warnings.append(
+                f"Reference {index + 1} normalized for upload: {tuple(item['original_dimensions'])} / "
+                f"{item['original_bytes']} bytes → {tuple(item['prepared_dimensions'])} / "
+                f"{item['prepared_bytes']} bytes. Original preserved."
+            )
     return ReferencePreparation(prepared, items, warnings,
                                 sum(item["original_bytes"] for item in items),
                                 sum(item["prepared_bytes"] for item in items))
@@ -1502,13 +1546,16 @@ def prepare_request_inputs(
         "sent_chars": len(args.prompt), "sent_bytes": len(args.prompt.encode("utf-8")),
     })
     args.prompt = prompt
-    validate_size_request(args)
     entry = next((entry for entry in selection.get("models", [])
                   if isinstance(entry, dict) and entry.get("id") == args.model), {})
     preparation = prepare_reference_images(references, destination,
                                           entry.get("reference_image_limits"), snapshot=snapshot)
+    size = validate_size_request(args, preparation.items)
     return {
         "prompt": prompt, "prompt_info": info, "reference_source": source,
+        "requested_size": size,
+        "size_source": ("explicit-size" if args.size else "explicit-aspect" if args.aspect
+                        else "original-reference" if references else "default-square"),
         "references": [str(path) for path in references],
         "request_references": [str(path) for path in preparation.paths],
         "reference_images": preparation.items, "reference_warnings": preparation.warnings,
@@ -1659,7 +1706,9 @@ def extract_image_candidates(payload: Any) -> list[ImageCandidate]:
         if hint in IMAGE_URL_KEYS | {"data", "result"} and re.match(r"^(?:iVBORw0KGgo|/9j/|R0lGOD|UklGR)", stripped):
             add_candidate(candidates, seen, ImageCandidate("base64", stripped))
             return
-        for match in DATA_URL_RE.finditer(stripped):
+        # Embedded URIs end at a line break; following prose can also consist
+        # entirely of Base64 letters. Standalone wrapped values are handled above.
+        for match in INLINE_DATA_URL_RE.finditer(stripped):
             add_candidate(
                 candidates,
                 seen,
@@ -1943,8 +1992,40 @@ def prepare_display(
     return warnings
 
 
-def validate_size_request(args: argparse.Namespace) -> str:
-    size = choose_size(args.size, args.aspect)
+def check_output_dimensions(images: list[dict[str, Any]], size: Any) -> list[str]:
+    requested = None
+    if isinstance(size, str):
+        with contextlib.suppress(ClientError):
+            requested = parse_size(size)
+    warnings = []
+    for image in images:
+        actual = (image.get("width"), image.get("height"))
+        image["matches_requested_size"] = actual == requested if requested and all(actual) else None
+        if image["matches_requested_size"] is False:
+            warnings.append(
+                f"Provider returned {actual[0]}x{actual[1]}, but {size} was requested. "
+                "The returned image was saved unchanged; report its actual dimensions, "
+                "do not claim the requested resolution or automatically resubmit."
+            )
+    return warnings
+
+
+def validate_size_request(args: argparse.Namespace, reference_images: list[dict[str, Any]] | None = None) -> str:
+    inherited = None
+    if not args.size and not args.aspect and reference_images:
+        original_sizes: set[tuple[int, int]] = set()
+        for image in reference_images:
+            dimensions = image.get("original_oriented_dimensions") or image.get("original_dimensions")
+            if (not isinstance(dimensions, (list, tuple)) or len(dimensions) != 2
+                    or any(type(value) is not int or value <= 0 for value in dimensions)):
+                raise ClientError("Cannot determine the original reference dimensions. Ask the user for --size or --aspect; no request was sent.")
+            original_sizes.add(tuple(dimensions))
+        if len(original_sizes) != 1:
+            sizes = ", ".join(f"{w}x{h}" for w, h in sorted(original_sizes))
+            raise ClientError(f"References have different original dimensions ({sizes}). Ask the user to choose --size or --aspect; no request was sent.")
+        width, height = next(iter(original_sizes))
+        inherited = f"{width}x{height}"
+    size = choose_size(args.size or inherited, args.aspect)
     high_resolution_intent = has_high_resolution_intent(args.prompt)
     if high_resolution_intent and not args.confirm_high_res:
         raise ClientError(
@@ -1958,6 +2039,12 @@ def validate_size_request(args: argparse.Namespace) -> str:
             "a default 1K request."
         )
     if size not in CONSERVATIVE_SIZES and not args.confirm_high_res:
+        if inherited:
+            raise ClientError(
+                f"Preserving original reference size {size} requires user confirmation. "
+                "Present published and experimental sizes, confirm this exact size, then "
+                f"retry with --size {size} --confirm-high-res. No lower-resolution request was sent."
+            )
         raise ClientError(
             f"Size {size} requires user confirmation. Run models, present published and "
             "experimental sizes, then retry with --confirm-high-res."
@@ -1969,7 +2056,7 @@ def run_argv(args: argparse.Namespace, thread_id: str) -> list[str]:
     result = [
         "run", "--prompt", args.prompt, "--model", args.model,
         "--selection-token", args.selection_token, "--mode", args.mode,
-        "--endpoint", args.endpoint, "--aspect", args.aspect,
+        "--endpoint", args.endpoint,
         "--thread-id", thread_id, "--timeout", str(args.timeout),
     ]
     for path in args.image:
@@ -1982,6 +2069,7 @@ def run_argv(args: argparse.Namespace, thread_id: str) -> list[str]:
         result.append("--confirm-codex-auth")
     for flag, value in (
         ("--custom-url", args.custom_url), ("--custom-kind", args.custom_kind),
+        ("--aspect", args.aspect),
         ("--size", args.size), ("--base-url", args.base_url),
         ("--output-dir", args.output_dir),
     ):
@@ -2154,7 +2242,7 @@ def command_start(args: argparse.Namespace) -> int:
     directory = job_directory(state_dir, job_id)
     directory.mkdir(parents=True, exist_ok=False)
     prepared_input = prepare_request_inputs(args, state_dir, selection, directory / "references", snapshot=True)
-    size = validate_size_request(args)
+    size = validate_size_request(args, prepared_input["reference_images"])
     try:
         claim_fd = os.open(str(claim), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         try:
@@ -2252,6 +2340,7 @@ def command_start(args: argparse.Namespace) -> int:
         "task_name": task_name,
         "thread_id": thread_id, "model": args.model,
         "requested_size": size, "started_at": started_at,
+        "size_source": prepared_input.get("size_source"),
         "prompt_info": prepared_input["prompt_info"],
         "reference_images": prepared_input["reference_images"],
         "warnings": prepared_input["reference_warnings"],
@@ -2402,6 +2491,18 @@ def command_last(args: argparse.Namespace) -> int:
         if not mime:
             raise ClientError(f"Saved file is not a recognized image: {path}")
         dimensions = detect_dimensions(raw, mime)
+        if dimensions is None:
+            try:
+                from PIL import Image
+            except ImportError:
+                pass
+            else:
+                try:
+                    with Image.open(io.BytesIO(raw)) as picture:
+                        picture.load()
+                        dimensions = picture.size
+                except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
+                    raise ClientError(f"Cannot decode saved image {path}: {error}") from error
         saved.append({
             "path": str(path.resolve()), "mime_type": mime, "bytes": len(raw),
             "width": dimensions[0] if dimensions else None,
@@ -2411,6 +2512,9 @@ def command_last(args: argparse.Namespace) -> int:
         raise ClientError("No image files are recorded for the latest result.")
     preview_dir = Path(args.preview_dir).expanduser().resolve() if args.preview_dir else None
     warnings = list(result.get("warnings", []))
+    for warning in check_output_dimensions(saved, result.get("requested_size")):
+        if warning not in warnings:
+            warnings.append(warning)
     if not current:
         warnings.append("Historical image only: the latest request has no saved successful image. This is not a newly generated result.")
     warnings.extend(prepare_display(saved, preview_dir))
@@ -2503,7 +2607,7 @@ def command_run(args: argparse.Namespace) -> int:
             args, state_dir, selection, state_dir / "request-inputs" / uuid.uuid4().hex,
         )
     args.prompt = prepared_input["prompt"]
-    size = validate_size_request(args)
+    size = validate_size_request(args, prepared_input["reference_images"])
     references = validate_reference_paths(prepared_input["request_references"])
     reference_source = prepared_input["reference_source"]
 
@@ -2557,6 +2661,7 @@ def command_run(args: argparse.Namespace) -> int:
                     f"Succeeded through {endpoint_label} after earlier endpoint failure."
                 )
             warnings.extend(partial_failures)
+            warnings.extend(check_output_dimensions(saved, size))
             if endpoint_label == "chat" and size not in CONSERVATIVE_SIZES:
                 warnings.append(
                     "Chat accepted the request, but the requested pixel dimensions are not guaranteed."
@@ -2570,6 +2675,7 @@ def command_run(args: argparse.Namespace) -> int:
                     "model": model,
                     "endpoint": endpoint_label,
                     "requested_size": size,
+                    "size_source": prepared_input.get("size_source"),
                     "reference_source": reference_source,
                     "references": prepared_input["references"],
                     "reference_images": prepared_input["reference_images"],
@@ -2654,7 +2760,7 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--custom-url")
     parser.add_argument("--custom-kind", choices=("images", "chat"))
     parser.add_argument("--size")
-    parser.add_argument("--aspect", default="square")
+    parser.add_argument("--aspect", help="Explicit output aspect; edits otherwise preserve original reference dimensions, new images default to square.")
     parser.add_argument("--confirm-high-res", action="store_true")
     parser.add_argument("--base-url")
     parser.add_argument("--output-dir")

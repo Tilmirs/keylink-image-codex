@@ -9,6 +9,7 @@ import os
 import shlex
 import shutil
 import sqlite3
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import time
 import unittest
 import urllib.error
 import xml.etree.ElementTree as ET
+import zlib
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,9 +33,18 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
-PNG_BYTES = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-)
+def png_image(width: int = 1024, height: int = 1024) -> bytes:
+    """A valid, normally sized fixture, also usable without Pillow installed."""
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    pixels = (b"\0" + b"\x20\x60\xa0" * width) * height
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(pixels)) + chunk(b"IEND", b""))
+
+
+# Edit defaults now inherit actual reference pixels; use a realistic canvas.
+PNG_BYTES = png_image()
 PNG_B64 = base64.b64encode(PNG_BYTES).decode("ascii")
 GPT_IMAGE_25_MODELS = (
     "gpt-image-2.5", "gpt-image-2.5-sunburst", "gpt-image-2.5-flare",
@@ -320,13 +331,17 @@ class KeylinkImageTests(unittest.TestCase):
             original = result["images"][0]["path"]
             self.assertNotEqual(original, result["images"][0]["display_path"])
             server.routes[("POST", "/v1/images/edits")] = json_response(
-                {"data": [{"b64_json": PNG_B64}]}
+                {"data": [{"b64_json": base64.b64encode(raw.getvalue()).decode("ascii")}]}
             )
             edited, edit_result = self.run_client(
                 workspace, server, "run", "--prompt", "change only the sky", "--model", "gpt-image-2",
+                "--size", "3840x2160", "--confirm-high-res",
             )
             self.assertEqual(edited.returncode, 0, edited.stdout + edited.stderr)
             self.assertEqual(edit_result["references"], [original])
+            self.assertEqual(edit_result["requested_size"], "3840x2160")
+            self.assertTrue(edit_result["images"][0]["matches_requested_size"])
+            self.assertIn(b'name="size"\r\n\r\n3840x2160', server.requests[0]["body"])
             self.assertEqual(Path(original).read_bytes(), raw.getvalue())
             reference = edit_result["reference_images"][0]
             self.assertNotEqual(reference["request_path"], result["images"][0]["display_path"])

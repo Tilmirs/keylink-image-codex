@@ -303,6 +303,7 @@ class EditRequestTests(unittest.TestCase):
             {"output": [{"type": "image_generation_call", "result": fixtures.PNG_B64}]},
             {"choices": [{"message": {"content": json.dumps({"image": fixtures.PNG_B64})}}]},
             {"choices": [{"message": {"content": f"图片：data:image/png;base64,{fixtures.PNG_B64}\nDone."}}]},
+            {"image_url": "data:image/png;base64," + "\n".join(fixtures.PNG_B64[i:i + 76] for i in range(0, len(fixtures.PNG_B64), 76))},
         ]
         with tempfile.TemporaryDirectory() as tmp:
             for payload in fixtures_to_parse:
