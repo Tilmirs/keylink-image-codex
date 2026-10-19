@@ -18,6 +18,100 @@ Image = fixtures.Image
 class EditRequestTests(unittest.TestCase):
     run_client = fixtures.KeylinkImageTests.run_client
 
+    def test_generate_mode_with_two_uploads_uses_edits_then_chat(self):
+        for endpoint in ("auto", "chat"):
+            with self.subTest(endpoint=endpoint), tempfile.TemporaryDirectory() as tmp, fixtures.running_server() as server:
+                root = Path(tmp).resolve()
+                refs = [root / "scene.png", root / "teacher.png"]
+                for ref in refs:
+                    ref.write_bytes(fixtures.PNG_BYTES)
+                server.routes[("POST", "/v1/images/edits")] = fixtures.json_response({"error": "unsupported"}, 400)
+                server.routes[("POST", "/v1/chat/completions")] = fixtures.json_response({"b64_json": fixtures.PNG_B64})
+                done, result = self.run_client(
+                    root, server, "run", "--model", "gpt-image-2.5-flare", "--mode", "generate",
+                    "--prompt", "Create a new composition using the scene and teacher references.",
+                    "--image", str(refs[0]), "--image", str(refs[1]), "--size", "1536x1024",
+                    "--endpoint", endpoint,
+                )
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                expected_paths = ["/v1/chat/completions"]
+                if endpoint == "auto":
+                    expected_paths.insert(0, "/v1/images/edits")
+                    body = server.requests[0]["body"]
+                    self.assertEqual(body.count(b'name="image"; filename='), 2)
+                    self.assertIn(b"gpt-image-2.5-flare", body)
+                    self.assertIn(b"1536x1024", body)
+                self.assertEqual([r["path"] for r in server.requests], expected_paths)
+                chat = json.loads(server.requests[-1]["body"])
+                self.assertEqual(chat["model"], "gpt-image-2.5-flare")
+                self.assertEqual(chat["size"], "1536x1024")
+                self.assertEqual(len(chat["images"]), 2)
+                self.assertEqual(len(chat["messages"][0]["content"]), 3)
+                for index in range(2):
+                    self.assertEqual(chat["images"][index]["image_url"],
+                                     chat["messages"][0]["content"][index + 1]["image_url"]["url"])
+                self.assertEqual(result["references"], [str(ref) for ref in refs])
+                self.assertEqual(result["reference_source"], "uploaded")
+                self.assertTrue(Path(result["images"][0]["path"]).is_file())
+
+    def test_generate_mode_preserves_explicit_references_but_skips_implicit_reuse(self):
+        for source in ("last", "uploaded", "none"):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp, fixtures.running_server() as server:
+                root = Path(tmp).resolve()
+                last = root / "last.png"
+                upload = root / "upload.png"
+                last.write_bytes(fixtures.PNG_BYTES)
+                upload.write_bytes(fixtures.PNG_BYTES)
+                state = root / ".keylink-image" / "threads" / "test-thread"
+                c.save_last_state(state, last, "gpt-image-2", "images-generations", "1024x1024")
+                server.routes[("POST", "/v1/images/edits")] = fixtures.json_response({"b64_json": fixtures.PNG_B64})
+                server.routes[("POST", "/v1/images/generations")] = fixtures.json_response({"b64_json": fixtures.PNG_B64})
+                options = ["--use-last"] if source != "none" else []
+                if source == "uploaded":
+                    options.extend(["--image", str(upload)])
+                done, result = self.run_client(root, server, "run", "--model", "gpt-image-2", "--mode", "generate",
+                                               "--prompt", "把刚才的天空改成红色", *options)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                expected_refs = {"last": [str(last)], "uploaded": [str(upload)], "none": []}
+                self.assertEqual(result["references"], expected_refs[source])
+                expected_endpoint = "images-generations" if source == "none" else "images-edits"
+                self.assertEqual(result["endpoint"], expected_endpoint)
+                self.assertEqual(len(server.requests), 1)
+
+    def test_input_preflight_failure_can_retry_same_model_selection(self):
+        for command in ("run", "start"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as tmp, fixtures.running_server() as server:
+                root = Path(tmp).resolve()
+                ref = root / "ref.png"
+                ref.write_bytes(fixtures.PNG_BYTES)
+                model = "gpt-image-2.5-flare"
+                server.routes[("GET", "/v1/models")] = fixtures.json_response({"data": [{"id": model}]})
+                server.routes[("POST", "/v1/images/edits")] = fixtures.json_response({"b64_json": fixtures.PNG_B64})
+                discovery, selection = self.run_client(root, server, "models")
+                self.assertEqual(discovery.returncode, 0, discovery.stdout)
+                options = ["--model", model, "--selection-token", selection["selection_token"],
+                           "--image", str(ref), "--mode", "generate", "--size", "1536x1024"]
+                server.requests.clear()
+                failed, error = self.run_client(root, server, command, "--prompt", "保留文字。" * 1000,
+                                               *options, auto_select=False)
+                self.assertEqual(failed.returncode, 1)
+                self.assertIn("Summarize", error["error"])
+                self.assertEqual(server.requests, [])
+                state = root / ".keylink-image" / "threads" / "test-thread"
+                self.assertFalse(c.read_json_file(state / "model-selection.json").get("used_at"))
+                self.assertFalse(list((state / "jobs").glob("*.claim")))
+                done, result = self.run_client(root, server, "run", "--prompt", "只把天空改为红色，保留文字。",
+                                               *options, auto_select=False)
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertEqual(result["model"], model)
+                self.assertEqual(result["requested_size"], "1536x1024")
+                self.assertEqual([r["path"] for r in server.requests], ["/v1/images/edits"])
+                duplicate, error = self.run_client(root, server, "run", "--prompt", "只把天空改为红色，保留文字。",
+                                                  *options, auto_select=False)
+                self.assertEqual(duplicate.returncode, 1)
+                self.assertIn("already been used", error["error"])
+                self.assertEqual(len(server.requests), 1)
+
     def test_latest_edit_is_only_prompt_sent_to_both_endpoints(self):
         with tempfile.TemporaryDirectory() as tmp, fixtures.running_server() as server:
             root = Path(tmp)
@@ -171,7 +265,7 @@ class EditRequestTests(unittest.TestCase):
             base_url = f"http://127.0.0.1:{server.server_address[1]}"
             state = root / "state"
             token = c.save_model_selection(state, [{"id": "gpt-image-2"}], base_url)
-            args = c.build_parser().parse_args(["start", "--prompt", "user: old\nassistant: done\nuser: remove sign", "--image", str(ref),
+            args = c.build_parser().parse_args(["start", "--mode", "generate", "--prompt", "user: old\nassistant: done\nuser: remove sign", "--image", str(ref),
                                                "--model", "gpt-image-2", "--selection-token", token, "--base-url", base_url])
             output = io.StringIO()
             with mock.patch.object(c, "thread_state_dir", return_value=state), \
@@ -195,6 +289,7 @@ class EditRequestTests(unittest.TestCase):
                 os.chdir(cwd)
             result = c.read_json_file(directory / "result.json")
             self.assertEqual(result["status"], "ok", result)
+            self.assertEqual(result["endpoint"], "images-edits")
             self.assertEqual(result["references"], [str(ref)])
             self.assertTrue(result["prompt_info"]["compacted"])
             self.assertEqual(len(server.requests), 1)

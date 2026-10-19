@@ -715,6 +715,15 @@ class KeylinkImageTests(unittest.TestCase):
             self.assertEqual(Path(recovered_result["images"][0]["path"]), output)
             self.assertEqual([request["path"] for request in server.requests],
                              ["/v1/images/generations"])
+            if os.name == "nt":
+                # Results are available before scheduled-task cleanup finishes.
+                # Windows cannot remove a still-running worker's cwd.
+                worker = client_module.read_json_file(job_dir / "job.json")
+                cleanup_deadline = time.monotonic() + 10
+                while client_module.process_is_running(worker.get("pid")):
+                    if time.monotonic() >= cleanup_deadline:
+                        self.fail("background worker did not exit after publishing its result")
+                    time.sleep(0.05)
 
     def test_process_probe_does_not_stop_worker(self) -> None:
         process = subprocess.Popen(

@@ -70,8 +70,8 @@ EDIT_CONTEXT_LINE_RE = re.compile(
 )
 EDIT_PROMPT_MAX_CHARS = 4000
 REFERENCE_MAX_DIMENSION = 2048
-REFERENCE_MAX_IMAGE_BYTES = 2 * 1024 * 1024
-REFERENCE_MAX_TOTAL_BYTES = 3 * 1024 * 1024
+REFERENCE_MAX_IMAGE_BYTES = 1024 * 1024
+REFERENCE_MAX_TOTAL_BYTES = 1024 * 1024
 REFERENCE_MIN_DIMENSION = 768
 REFERENCE_MAX_COUNT = 16
 REQUEST_MAX_BYTES = 9 * 1024 * 1024
@@ -97,6 +97,10 @@ CORRECTION_INTENT_RE = re.compile(
 
 class ClientError(RuntimeError):
     """Expected user-facing client failure."""
+
+
+class RefusalError(ClientError):
+    """An explicit provider refusal is not an image result or a retry signal."""
 
 
 class CredentialConfirmationRequired(ClientError):
@@ -790,12 +794,20 @@ class HttpClient:
                 return response.read(), content_type
         except urllib.error.HTTPError as error:
             record.update(http_status=error.code, error_kind="http_error")
+            raw_error = b""
             try:
-                detail = safe_response_text(error.read()) or error.reason
+                raw_error = error.read()
+                detail = safe_response_text(raw_error) or error.reason
             except (OSError, http.client.HTTPException) as read_error:
                 detail = f"{error.reason} (could not read error body: {read_error})"
             finally:
                 error.close()
+            try:
+                refusal_payload = json.loads(raw_error)
+            except (ValueError, TypeError, UnicodeError):
+                pass
+            else:
+                check_provider_refusal(refusal_payload)
             raise APIError(
                 f"HTTP {error.code} for {request.full_url}: {detail}", error.code
             ) from error
@@ -826,6 +838,13 @@ def parse_api_response(raw: bytes, content_type: str | None) -> Any:
         if content_type in {"text/plain", "text/markdown"} and extract_image_candidates(text):
             return {"content": text}
         raise ClientError("The endpoint returned non-JSON content without a recognized image response.") from error
+    validate_api_payload(payload)
+    return payload
+
+
+def validate_api_payload(payload: Any) -> None:
+    """Validate decoded responses, including JSON embedded in Chat text."""
+    check_provider_refusal(payload)
     if isinstance(payload, dict):
         nested = payload.get("error")
         code = payload.get("status_code", payload.get("code"))
@@ -838,7 +857,37 @@ def parse_api_response(raw: bytes, content_type: str | None) -> Any:
         if nested or (status is not None and status >= 400):
             detail = safe_response_text(json.dumps(nested or payload, ensure_ascii=False).encode("utf-8"))
             raise APIError(f"API error{f' {status}' if status else ''}: {detail}", status)
-    return payload
+
+
+def check_provider_refusal(payload: Any) -> None:
+    """Recognize explicit structured refusal signals, not prompt wording."""
+    def visit(value: Any, depth: int = 0) -> bool:
+        if depth > 16:
+            return False
+        if isinstance(value, list):
+            return any(visit(item, depth + 1) for item in value)
+        if not isinstance(value, dict):
+            return False
+        if str(value.get("role", "")).lower() in {"user", "system", "developer", "tool"}:
+            return False
+        for key, nested in value.items():
+            field = str(key).lower()
+            if field in {"input", "prompt", "revised_prompt", "metadata", "usage"}:
+                continue
+            if field == "refusal" and nested:
+                return True
+            if field in {"finish_reason", "finishreason", "block_reason", "blockreason", "code", "type"}:
+                if str(nested).lower() in {
+                    "content_filter", "content_policy_violation", "safety", "safety_violation",
+                    "prohibited_content", "blocklist", "moderation_blocked", "refusal",
+                }:
+                    return True
+            if isinstance(nested, (dict, list)) and visit(nested, depth + 1):
+                return True
+        return False
+
+    if visit(payload):
+        raise RefusalError("The provider explicitly refused this request. No new image was generated; previous images must not be presented as its result.")
 
 
 def encode_multipart(
@@ -1149,7 +1198,8 @@ def save_model_selection(
         "issued_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "used_at": None,
     }
-    write_json_file(state_dir / "model-selection.json", payload)
+    with image_state_lock(state_dir):
+        write_json_file(state_dir / "model-selection.json", payload)
     return token
 
 
@@ -1205,26 +1255,118 @@ def consume_model_selection(
     model: str,
     base_url: str,
 ) -> None:
-    lock_path = state_dir / ".model-selection.lock"
-    lock_fd: int | None = None
-    for _ in range(100):
-        try:
-            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            time.sleep(0.05)
-    if lock_fd is None:
-        raise ClientError("The current model selection is already being used by another request.")
-    try:
+    with image_state_lock(state_dir):
         data = validate_model_selection(state_dir, selection_token, model, base_url)
         data["used_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         write_json_file(state_dir / "model-selection.json", data)
-    finally:
-        os.close(lock_fd)
+        _record_image_request_unlocked(state_dir, selection_token, model)
+
+
+def image_request_id(selection_token: str) -> str:
+    return hashlib.sha256(selection_token.encode("utf-8")).hexdigest()[:24]
+
+
+@contextlib.contextmanager
+def image_state_lock(state_dir: Path) -> Iterable[None]:
+    """Serialize state updates; OS locks are released if a worker is killed."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    with (state_dir / ".image-state.lock").open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if not stream.tell():
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            acquire = lambda: msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            acquire = lambda: fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release = lambda: fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+        for attempt in range(100):
+            try:
+                acquire()
+                break
+            except OSError:
+                if attempt == 99:
+                    raise ClientError("Image state is busy; wait for the active task and check its status.")
+                time.sleep(0.05)
         try:
-            lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            yield
+        finally:
+            release()
+
+
+def record_image_request(state_dir: Path, token: str, model: str, *, job_id: str | None = None) -> None:
+    with image_state_lock(state_dir):
+        _record_image_request_unlocked(state_dir, token, model, job_id=job_id)
+
+
+def _record_image_request_unlocked(state_dir: Path, token: str, model: str, *, job_id: str | None = None) -> None:
+    # Caller holds image_state_lock, including when consuming a selection.
+    identifier = image_request_id(token)
+    previous = read_json_file(state_dir / "latest-request.json")
+    record = previous if isinstance(previous, dict) and previous.get("request_id") == identifier else {
+        "request_id": identifier, "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    record.update(status="running", model=model)
+    record.pop("finished_at", None)
+    if job_id:
+        record["job_id"] = job_id
+    write_json_file(state_dir / "latest-request.json", record)
+
+
+def finish_image_request(state_dir: Path, token: str, status: str) -> None:
+    with image_state_lock(state_dir):
+        record = read_json_file(state_dir / "latest-request.json")
+        if isinstance(record, dict) and record.get("request_id") == image_request_id(token):
+            record.update(status=status, finished_at=dt.datetime.now(dt.timezone.utc).isoformat())
+            write_json_file(state_dir / "latest-request.json", record)
+
+
+def latest_image_request(state_dir: Path) -> dict[str, Any] | None:
+    record = read_json_file(state_dir / "latest-request.json")
+    candidates = [record] if isinstance(record, dict) else []
+    # Recover enough provenance for tasks created before latest-request.json existed.
+    selection = read_json_file(state_dir / "model-selection.json")
+    if (isinstance(selection, dict) and selection.get("used_at")
+            and (not isinstance(record, dict)
+                 or record.get("request_id") != image_request_id(str(selection.get("token", ""))))):
+        candidates.append({"started_at": selection["used_at"], "status": "unknown",
+                           "request_id": image_request_id(str(selection.get("token", ""))),
+                           "model": selection.get("model")})
+    latest_job = read_json_file(state_dir / "latest-job.json")
+    if isinstance(latest_job, dict) and latest_job.get("job_id"):
+        job = read_json_file(job_directory(state_dir, latest_job["job_id"]) / "job.json")
+        if isinstance(job, dict) and job.get("started_at"):
+            if isinstance(record, dict) and record.get("job_id") == latest_job["job_id"]:
+                # A worker can fail before reaching API submission, or stop abruptly.
+                if job.get("status") == "failed" and record.get("status") != "refused":
+                    record["status"] = "failed"
+            else:
+                candidates.append(job)
+    return max(candidates, key=lambda item: timestamp_value(item.get("started_at")), default=None)
+
+
+def timestamp_value(value: Any) -> float:
+    try:
+        parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=parsed.tzinfo or dt.timezone.utc).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return float("-inf")
+
+
+def matches_latest_request(latest: dict[str, Any] | None, *, request_id: str | None = None,
+                           job_id: str | None = None, timestamp: Any = None) -> bool:
+    if not latest:
+        return True
+    if request_id and latest.get("request_id"):
+        return request_id == latest["request_id"]
+    if job_id and latest.get("job_id"):
+        return job_id == latest["job_id"]
+    return (timestamp_value(timestamp) != float("-inf")
+            and timestamp_value(timestamp) >= timestamp_value(latest.get("started_at")))
 
 
 def validate_reference_paths(paths: Iterable[str]) -> list[Path]:
@@ -1353,8 +1495,8 @@ def prepare_request_inputs(
     if not references and use_last:
         references = [load_last_image(state_dir)]
         source = "last-successful-image" if args.use_last or args.mode == "edit" else "auto-correction-last-image"
-    if args.mode == "generate" and references:
-        raise ClientError("Generate mode cannot discard reference images. Use auto or edit mode.")
+    # Explicit references (including --use-last) determine the image operation.
+    # generate only disables implicit reuse based on correction wording.
     prompt, info = sanitize_edit_prompt(args.prompt) if references else (args.prompt, {
         "compacted": False, "original_chars": len(args.prompt),
         "sent_chars": len(args.prompt), "sent_bytes": len(args.prompt.encode("utf-8")),
@@ -1383,7 +1525,7 @@ def save_last_state(
     endpoint: str,
     requested_size: str,
     result: dict[str, Any] | None = None,
-) -> None:
+) -> bool:
     state_dir.mkdir(parents=True, exist_ok=True)
     payload = {
         "path": str(image_path.resolve()),
@@ -1394,7 +1536,16 @@ def save_last_state(
     }
     if result is not None:
         payload["result"] = result
-    write_json_file(state_dir / "last.json", payload)
+    with image_state_lock(state_dir):
+        latest = latest_image_request(state_dir)
+        if result and result.get("request_id") and not matches_latest_request(
+            latest, request_id=result["request_id"], timestamp=payload["saved_at"],
+        ):
+            # The older job keeps its own saved files/result, but cannot replace
+            # a later request's last image or reference for the next edit.
+            return False
+        write_json_file(state_dir / "last.json", payload)
+    return True
 
 
 def build_chat_payload(
@@ -1492,6 +1643,7 @@ def extract_image_candidates(payload: Any) -> list[ImageCandidate]:
             except ValueError:
                 pass
             else:
+                validate_api_payload(decoded)
                 walk(decoded, hint, depth + 1)
                 return
         data_match = DATA_URL_RE.fullmatch(stripped)
@@ -1540,6 +1692,9 @@ def extract_image_candidates(payload: Any) -> list[ImageCandidate]:
             return
 
         normalized = {key.lower(): nested for key, nested in value.items()}
+        if str(normalized.get("role", "")).lower() in {"user", "system", "developer", "tool"}:
+            return
+        validate_api_payload(normalized)
         item_type = str(normalized.get("type", "")).lower()
         mime = str(normalized.get("mime_type", normalized.get("mimetype", normalized.get("media_type", ""))))
         image_context = "image" in item_type or mime.startswith("image/") or hint in {"image", "output_image", "source", "inline_data", "inlinedata"}
@@ -1679,13 +1834,34 @@ def save_candidates(
             mime_type = detected_mime
             if not raw or not mime_type:
                 raise ClientError("Downloaded or decoded content is not a recognized image.")
+            dimensions = detect_dimensions(raw, mime_type)
+            try:
+                from PIL import Image
+            except ImportError:
+                if mime_type in {"image/png", "image/jpeg", "image/gif"} and not dimensions:
+                    raise ClientError("Image has no readable dimensions; its data may be truncated.")
+                if (mime_type == "image/png" and b"\0\0\0\0IEND\xaeB`\x82" not in raw
+                        or mime_type == "image/jpeg" and b"\xff\xd9" not in raw[2:]
+                        or mime_type == "image/gif" and b";" not in raw[10:]
+                        or mime_type == "image/webp" and len(raw) < int.from_bytes(raw[4:8], "little") + 8):
+                    raise ClientError("Image data is truncated. Install Pillow for full decoding validation.")
+            else:
+                try:
+                    with Image.open(io.BytesIO(raw)) as picture:
+                        picture.verify()
+                    with Image.open(io.BytesIO(raw)) as picture:
+                        picture.load()
+                        dimensions = picture.size
+                except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as error:
+                    raise ClientError(f"Image data could not be decoded or validated: {error}") from error
+            if dimensions and min(dimensions) <= 0:
+                raise ClientError("Image has invalid pixel dimensions.")
             extension = extension_for_mime(mime_type)
             filename = (
                 f"{timestamp}-{safe_slug(model)}-{safe_slug(endpoint_label)}-{index}{extension}"
             )
             path = (output_dir / filename).resolve()
             path.write_bytes(raw)
-            dimensions = detect_dimensions(raw, mime_type)
             saved.append(
                 {
                     "path": str(path),
@@ -2011,13 +2187,10 @@ def command_start(args: argparse.Namespace) -> int:
     }
     job = {
         "job_id": job_id, "status": "starting", "thread_id": thread_id,
+        "request_id": image_request_id(args.selection_token),
         "model": args.model, "requested_size": size, "started_at": started_at,
         "cwd": request["cwd"],
     }
-    write_json_file(directory / "request.json", request)
-    write_json_file(directory / "job.json", job)
-    write_json_file(state_dir / "latest-job.json", {"job_id": job_id})
-
     command = [
         sys.executable, "-X", "utf8", str(Path(__file__).resolve()),
         "_worker", "--job-dir", str(directory.resolve()),
@@ -2040,33 +2213,32 @@ def command_start(args: argparse.Namespace) -> int:
     launch_mode = "detached-process"
     task_name = None
     try:
-        process = subprocess.Popen(command, **popen_kwargs)
-    except PermissionError:
-        if os.name != "nt":
-            raise
+        write_json_file(directory / "request.json", request)
+        write_json_file(directory / "job.json", job)
+        write_json_file(state_dir / "latest-job.json", {"job_id": job_id})
+        record_image_request(state_dir, args.selection_token, args.model, job_id=job_id)
         try:
+            process = subprocess.Popen(command, **popen_kwargs)
+        except PermissionError:
+            if os.name != "nt":
+                raise
             task_name = create_windows_worker_task(command, request["cwd"], job_id)
             launch_mode = "scheduled-task"
             job.update(task_name=task_name, launch_mode=launch_mode)
             write_json_file(directory / "job.json", job)
             run_windows_worker_task(task_name, request["cwd"])
-        except ClientError as error:
+    except (OSError, ClientError) as error:
+        try:
             delete_windows_task(task_name)
-            job.update(
-                status="failed",
-                finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
-                error=str(error),
-            )
-            write_json_file(directory / "job.json", job)
-            try:
-                claim.unlink()
-            except OSError:
-                pass
-            raise
-    except OSError as error:
+        except OSError:
+            pass
         job.update(status="failed", finished_at=dt.datetime.now(dt.timezone.utc).isoformat(),
                    error=f"Could not start background worker: {error}")
-        write_json_file(directory / "job.json", job)
+        # Storage itself may have caused the failure. Release the unused claim
+        # even when the failure record cannot be written.
+        with contextlib.suppress(OSError, ClientError):
+            write_json_file(directory / "job.json", job)
+            finish_image_request(state_dir, args.selection_token, "failed")
         try:
             claim.unlink()
         except OSError:
@@ -2116,7 +2288,6 @@ def command_worker(args: argparse.Namespace) -> int:
             emit({"status": "error", "error": f"Background worker failed: {error}"}, stream=output)
         exit_code = 1
     payload = read_json_file(temporary)
-    delete_windows_task(job.get("task_name"))
     job.update(
         status="succeeded" if exit_code == 0 and isinstance(payload, dict)
         and payload.get("status") == "ok" else "failed",
@@ -2126,6 +2297,13 @@ def command_worker(args: argparse.Namespace) -> int:
     write_json_file(directory / "job.json", job)
     # Publishing the result is the final step; readers can then use it immediately.
     temporary.replace(directory / "result.json")
+    try:
+        delete_windows_task(job.get("task_name"))
+    except OSError as error:
+        # Scheduler cleanup must not hide an already completed image request.
+        with contextlib.suppress(OSError):
+            with (directory / "worker.log").open("a", encoding="utf-8") as log:
+                log.write(f"Result saved; scheduled-task cleanup failed: {error}\n")
     return 0
 
 
@@ -2140,10 +2318,25 @@ def command_status(args: argparse.Namespace) -> int:
     if not isinstance(job, dict):
         raise ClientError(f"Background job {job_id} has no readable status record.")
     payload = read_json_file(directory / "result.json")
+    current = matches_latest_request(
+        latest_image_request(state_dir), job_id=job_id, timestamp=job.get("started_at"),
+        request_id=job.get("request_id") or (payload.get("request_id") if isinstance(payload, dict) else None),
+    )
+    if not current and not args.job_id:
+        emit({
+            "status": "error", "thread_id": thread_id, "images": [],
+            "current_request_succeeded": False, "previous_job_id": job_id,
+            "error": "The saved background job belongs to an earlier request. Check the latest command/session result; this job is not evidence that the latest request succeeded.",
+        })
+        return 1
     if isinstance(payload, dict):
         result = dict(payload)
         result.update(background=True, job_id=job_id,
-                      job_status="succeeded" if result.get("status") == "ok" else "failed")
+                      job_status="succeeded" if result.get("status") == "ok" else "failed",
+                      historical=not current,
+                      current_request_succeeded=current and result.get("status") == "ok")
+        if not current:
+            result["warnings"] = list(result.get("warnings", [])) + ["Historical job result only; this is not the latest request's result."]
         emit(result)
         return 0 if result.get("status") == "ok" else 1
     status = str(job.get("status", "unknown"))
@@ -2158,6 +2351,7 @@ def command_status(args: argparse.Namespace) -> int:
         write_json_file(directory / "job.json", job)
     emit({
         "status": status, "background": True, "job_id": job_id,
+        "historical": not current, "current_request_succeeded": False,
         "thread_id": thread_id, "model": job.get("model"),
         "requested_size": job.get("requested_size"), "started_at": job.get("started_at"),
         "pid": job.get("pid"), "error": job.get("error"),
@@ -2174,8 +2368,22 @@ def command_last(args: argparse.Namespace) -> int:
     thread_id = resolve_thread_id(args.thread_id)
     state_dir = thread_state_dir(thread_id)
     state = read_json_file(state_dir / "last.json")
+    latest = latest_image_request(state_dir)
+    result = state.get("result") if isinstance(state, dict) else None
+    current = matches_latest_request(
+        latest, timestamp=state.get("saved_at") if isinstance(state, dict) else None,
+        request_id=result.get("request_id") if isinstance(result, dict) else None,
+    )
+    if not current and not args.allow_previous:
+        emit({
+            "status": "error", "thread_id": thread_id,
+            "error": "The latest request has no saved successful image. The previous image is not its result. Check the original command or background job status.",
+            "latest_request": latest, "current_request_succeeded": False,
+            "previous_result_available": isinstance(state, dict), "images": [],
+        })
+        return 1
     first_path = load_last_image(state_dir)
-    result = state.get("result")
+    result = dict(result) if isinstance(result, dict) else None
     if not isinstance(result, dict):
         result = {
             "model": state.get("model"),
@@ -2203,10 +2411,13 @@ def command_last(args: argparse.Namespace) -> int:
         raise ClientError("No image files are recorded for the latest result.")
     preview_dir = Path(args.preview_dir).expanduser().resolve() if args.preview_dir else None
     warnings = list(result.get("warnings", []))
+    if not current:
+        warnings.append("Historical image only: the latest request has no saved successful image. This is not a newly generated result.")
     warnings.extend(prepare_display(saved, preview_dir))
     result.update(
         status="ok", recovered=True, thread_id=thread_id,
         saved_at=state.get("saved_at"), images=saved, warnings=warnings,
+        historical=not current, current_request_succeeded=current,
     )
     emit(result)
     return 0
@@ -2354,6 +2565,8 @@ def command_run(args: argparse.Namespace) -> int:
             warnings.extend(prepare_display(saved))
             result = {
                     "status": "ok",
+                    "request_id": image_request_id(args.selection_token),
+                    "current_request_succeeded": True,
                     "model": model,
                     "endpoint": endpoint_label,
                     "requested_size": size,
@@ -2371,21 +2584,41 @@ def command_run(args: argparse.Namespace) -> int:
                     "failed_attempts": attempts,
                     "warnings": warnings,
                 }
-            save_last_state(state_dir, first_path, model, endpoint_label, size, result)
+            try:
+                published = save_last_state(state_dir, first_path, model, endpoint_label, size, result)
+                if not published:
+                    result.update(historical=True, current_request_succeeded=False)
+                    warnings.append("This earlier request finished after a newer request started; its image was saved without replacing the latest result.")
+                finish_image_request(state_dir, args.selection_token, "succeeded")
+            except (OSError, ClientError) as state_error:
+                # The image is already saved. A local state failure must never
+                # trigger another potentially billable generation endpoint.
+                result["state_recorded"] = False
+                warnings.append(f"Image saved, but request state could not be updated: {state_error}. Use the returned image paths; do not resubmit.")
             emit(result)
             return 0
         except ClientError as error:
+            if isinstance(error, RefusalError):
+                phase = "provider_refusal"
             attempt = {"endpoint": endpoint_label, "error": str(error), "phase": phase,
                        "elapsed_seconds": round(time.monotonic() - started, 3),
                        "candidate_count": len(candidates)}
             if response is not None:
                 attempt["response_shape"] = response_shape(response)
             attempts.append(attempt)
+            if isinstance(error, RefusalError):
+                break
 
     automatic = args.endpoint == "auto"
+    refused = any(item.get("phase") == "provider_refusal" for item in attempts)
+    finish_image_request(state_dir, args.selection_token, "refused" if refused else "failed")
     emit(
         {
             "status": "error",
+            "request_id": image_request_id(args.selection_token),
+            "error": "The provider refused this request; no new image was saved." if refused else "Image request failed; no new image was saved. See attempts for endpoint errors.",
+            "current_request_succeeded": False,
+            "provider_refused": refused,
             "model": model,
             "requested_size": size,
             "reference_source": reference_source,
@@ -2397,7 +2630,7 @@ def command_run(args: argparse.Namespace) -> int:
             "base_url": base_url,
             "base_url_source": base_source,
             "attempts": attempts,
-            "ask_user_to_switch_model": automatic and len(attempts) > 1,
+            "ask_user_to_switch_model": not refused and automatic and len(attempts) > 1,
         }
     )
     return 1
@@ -2409,7 +2642,12 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--selection-token")
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--use-last", action="store_true")
-    parser.add_argument("--mode", choices=("auto", "generate", "edit"), default="auto")
+    parser.add_argument(
+        "--mode", choices=("auto", "generate", "edit"), default="auto",
+        help="auto detects corrections; generate disables implicit last-image reuse; "
+             "edit reuses the last image if no upload is supplied. "
+             "--image and --use-last always use image editing.",
+    )
     parser.add_argument(
         "--endpoint", choices=("auto", "images", "chat", "custom"), default="auto"
     )
@@ -2447,6 +2685,7 @@ def build_parser() -> argparse.ArgumentParser:
     last = subparsers.add_parser("last", help="Recover saved images locally without API requests.")
     last.add_argument("--thread-id")
     last.add_argument("--preview-dir", help="Directory for small display copies; originals are preserved.")
+    last.add_argument("--allow-previous", action="store_true", help="Explicitly recover a historical image when the latest request has no saved result.")
     last.set_defaults(handler=command_last)
 
     run = subparsers.add_parser("run", help="Generate or edit an image.")

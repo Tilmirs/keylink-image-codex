@@ -33,12 +33,14 @@ The top-level compatibility field initially uses a data URL string, preserving c
 
 ## Edit prompts and reference budgets
 
+References determine the operation for both `run` and `start`: `--image` or `--use-last` uses Images Edits first, then Chat in automatic endpoint mode, even with `--mode generate`. Explicit endpoint choices still apply. Prefer `--mode auto` when supplying references. For an independent text-only generation, omit both reference options and use `--mode generate` to disable correction-based last-image reuse.
+
 Only the current edit instructions belong in the prompt. The client unwraps explicit JSON `prompt`/`messages`, transcript role blocks, edit headings and tagged context. Ambiguous remaining context or more than 4,000 characters after cleanup stops locally so Codex can produce a concise prompt while retaining required image text and constraints. Ordinary generation prompts are preserved. No semantic truncation or automatic removal of visual details is performed.
 
 Default **client budgets**, not claims about Keylink's model limits:
 
 - At most 16 references, longest edge 2048 pixels, no cropping or upscaling.
-- At most 2 MiB per reference and 3 MiB across all references. The total budget is divided among references so both endpoint representations fit.
+- At most 1 MiB per reference and 1 MiB across all references. Larger references are compressed before either endpoint; the total budget is divided among multiple references. The two Base64 copies in Chat then occupy about 2.67 MiB plus JSON/prompt overhead, rather than about 5.3 MiB for a single 2 MiB source. This cannot guarantee acceptance by a channel with a lower undocumented limit.
 - At most 9 MiB for the encoded request body, including the two Chat Base64 representations and prompt. Oversized bodies stop before networking.
 
 The exact selected model's explicit `reference_image_limits` or `input_image_limits`, at the entry root or in `capabilities`, can lower these budgets through integer `max_bytes`, `max_total_bytes`, `max_width`, `max_height`, and `max_images`. Output resolution metadata is never interpreted as a reference limit. When no input limits are published, `reference_limit_source` reports `client-budget`; an undocumented channel may still reject the request with 413.
@@ -49,7 +51,7 @@ Pillow validates references and produces separate PNG/JPEG upload copies when ne
 
 ## Sizes
 
-Before every request, `models` must query `GET /v1/models` and the user must choose from the returned catalog. `run` requires the one-use selection token returned by that query. Tokens are bound to the Codex task and API host and cannot be reused for another image request.
+Before every new generation or edit, `models` must query `GET /v1/models` and the user must choose from the returned catalog. `run` and `start` require the one-use selection token returned by that query. Tokens are bound to the Codex task and API host and cannot be reused for another image request. If input preflight fails before any job starts and while the token is still unused and current, correct the same request with that token and chosen model; do not refresh the catalog or ask for the same choice again. Check `status` for an existing job, and never reset a used token.
 
 The conservative size set is:
 
@@ -68,6 +70,16 @@ Do not claim a lower-resolution result is 2K or 4K. Do not retry a confirmed hig
 Saving an image and displaying it are separate stages. Codex's image viewer may fail to load a large 4K PNG with an `invalid base64`/`Invalid padding` error even when the file is intact. The client generates a small JPEG display copy with optional Pillow and always preserves the original for delivery and later edits. Preview failures do not trigger endpoint fallback or another generation. `last` recovers saved results without API calls, including results saved by older client versions.
 
 For high-resolution requests, `start` creates a detached worker and returns a job ID. `status` reads the worker's atomic result file and never starts another request. If the Codex task is interrupted while Keylink is processing, resume with the same workspace and thread ID, poll `status`, and then display the saved result. A request started by an older client cannot be reconstructed from the Keylink billing log; use `last` only when the original client actually saved a local result.
+
+`latest-request.json` tracks the current request ID and running/succeeded/failed/refused state. `last` refuses to deliver an older success as the current request's result; legacy tasks also check consumed-selection and job start timestamps. API rejection does not overwrite `last.json`. Explicitly requested historical recovery uses `last --allow-previous` and is labeled `historical: true`, never a new generation. Input preparation and `--use-last` may still read the last successful original for a new edit.
+
+The default `status` rejects a background job superseded by a later request; explicitly querying an old job marks its output historical. Timestamps are compared as instants across UTC/offset formats. State updates use an OS lock released on process exit, and an earlier request finishing late cannot replace the current request's saved reference. If a saved image's history update fails, return the image with `state_recorded: false`; never use endpoint fallback to repeat a generation because of that local state error.
+
+Structured `refusal`, `content_filter`, Gemini `blockReason`/`finishReason` safety blocks, and content-policy error codes are failures even if the response also contains an image field. Inspect the full HTTP error response before truncating diagnostic text; JSON embedded in Chat content and nested response containers must pass the same refusal/API-error checks before extracting images. An explicit provider refusal stops automatic endpoint fallback and model-switch suggestions. Echoed messages with user/system/developer/tool roles are not output images. No prompt is automatically rewritten to bypass a refusal.
+
+Pillow verifies and decodes returned images before saving them as successful results; truncated or corrupt candidates follow the download/decoding failure policy. Without Pillow, validation is limited to image signatures, readable dimensions where supported, and basic completeness checks. Installing Pillow is recommended for complete decoding validation as well as reference normalization.
+
+Model selection writes and consumption share the process-lifetime state lock, so interrupted processes cannot leave a permanent selection lock and concurrent requests cannot consume one selection twice. Background metadata/launch failures release the unsubmitted selection claim. Completed worker results are published before scheduled-task cleanup; a cleanup failure is logged without losing the image or submitting another generation.
 
 The client accepts image URLs, data URLs, Base64 fields, camelCase URL fields, nested Chat text/images, generated image/artifact arrays, Gemini `inlineData`, and image `source.data`. Markdown/HTML image links and bare image URLs are recognized. JSON error envelopes (including `status_code=400/413` inside HTTP 200) remain API errors rather than missing-image errors. Saved files must have recognizable image bytes; an `image/*` header alone is not enough. An image candidate that failed to download/decode is diagnosed separately from a response with no candidate. URL downloads inherit authentication only when the image URL uses the same host as the configured API root, preventing credentials from being sent to unrelated hosts.
 
