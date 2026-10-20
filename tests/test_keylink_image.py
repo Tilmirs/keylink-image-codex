@@ -167,12 +167,12 @@ class KeylinkImageTests(unittest.TestCase):
             )
             server.requests.clear()
         entrypoint = [str(CLIENT)]
-        if force_scheduled_task:
+        if force_scheduled_task or (os.name == "nt" and args[0] == "start"):
             entrypoint = ["-c", "\n".join([
                 "import runpy, subprocess, sys",
                 "popen = subprocess.Popen",
                 "def deny_breakaway(*args, **kwargs):",
-                "    if kwargs.get('creationflags', 0) & 0x01000000:",
+                f"    if {force_scheduled_task!r} and kwargs.get('creationflags', 0) & 0x01000000:",
                 "        raise PermissionError('test: breakaway denied')",
                 "    return popen(*args, **kwargs)",
                 "subprocess.Popen = deny_breakaway",
@@ -263,7 +263,7 @@ class KeylinkImageTests(unittest.TestCase):
                 {"data": [{"b64_json": PNG_B64}, {"b64_json": second_b64}]}
             )
             first, generated = self.run_client(
-                workspace, server, "run", "--prompt", "a landscape", "--model", "gpt-image-2"
+                workspace, server, "run", "--prompt", "a landscape", "--model", "gpt-image-2", "--count", "2"
             )
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             server.requests.clear()

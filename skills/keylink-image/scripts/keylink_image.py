@@ -48,6 +48,7 @@ DEFAULT_MODEL_PRIORITY = (
 )
 CONSERVATIVE_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 EXPERIMENTAL_SIZES = ("2560x1440", "3840x2160")
+OUTPUT_MAX_COUNT = 4
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
 DATA_URL_RE = re.compile(
     r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/_-]+(?:\r?\n[A-Za-z0-9+/_-]+)*={0,2})", re.I
@@ -1647,14 +1648,15 @@ def attempt_images(
     size: str,
     references: list[Path],
     custom_url: str | None = None,
+    *, count: int = 1,
 ) -> tuple[Any, str]:
     if references:
         url = custom_url or endpoint_url(client.base_url, "/v1/images/edits")
-        fields = {"model": model, "prompt": prompt, "size": size, "n": "1"}
+        fields = {"model": model, "prompt": prompt, "size": size, "n": str(count)}
         return client.request_multipart(url, fields, references), "images-edits"
 
     url = custom_url or endpoint_url(client.base_url, "/v1/images/generations")
-    payload = {"model": model, "prompt": prompt, "size": size, "n": 1}
+    payload = {"model": model, "prompt": prompt, "size": size, "n": count}
     return client.request_json("POST", url, payload), "images-generations"
 
 
@@ -1868,15 +1870,18 @@ def save_candidates(
     output_dir: Path,
     model: str,
     endpoint_label: str,
+    *, limit: int | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     if not candidates:
         raise ClientError("The endpoint returned HTTP 200 but no image was found.")
     output_dir.mkdir(parents=True, exist_ok=True)
     saved: list[dict[str, Any]] = []
     failures: list[str] = []
-    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    timestamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + uuid.uuid4().hex[:12]
 
     for index, candidate in enumerate(candidates, start=1):
+        if limit is not None and len(saved) >= limit:
+            break
         try:
             raw, declared_mime = decode_candidate(candidate, client)
             detected_mime = detect_mime_type(raw)
@@ -2056,7 +2061,7 @@ def run_argv(args: argparse.Namespace, thread_id: str) -> list[str]:
     result = [
         "run", "--prompt", args.prompt, "--model", args.model,
         "--selection-token", args.selection_token, "--mode", args.mode,
-        "--endpoint", args.endpoint,
+        "--endpoint", args.endpoint, "--count", str(args.count),
         "--thread-id", thread_id, "--timeout", str(args.timeout),
     ]
     for path in args.image:
@@ -2276,7 +2281,8 @@ def command_start(args: argparse.Namespace) -> int:
     job = {
         "job_id": job_id, "status": "starting", "thread_id": thread_id,
         "request_id": image_request_id(args.selection_token),
-        "model": args.model, "requested_size": size, "started_at": started_at,
+        "model": args.model, "requested_size": size, "requested_count": args.count,
+        "started_at": started_at,
         "cwd": request["cwd"],
     }
     command = [
@@ -2339,7 +2345,7 @@ def command_start(args: argparse.Namespace) -> int:
         "launch_mode": launch_mode,
         "task_name": task_name,
         "thread_id": thread_id, "model": args.model,
-        "requested_size": size, "started_at": started_at,
+        "requested_size": size, "requested_count": args.count, "started_at": started_at,
         "size_source": prepared_input.get("size_source"),
         "prompt_info": prepared_input["prompt_info"],
         "reference_images": prepared_input["reference_images"],
@@ -2442,7 +2448,8 @@ def command_status(args: argparse.Namespace) -> int:
         "status": status, "background": True, "job_id": job_id,
         "historical": not current, "current_request_succeeded": False,
         "thread_id": thread_id, "model": job.get("model"),
-        "requested_size": job.get("requested_size"), "started_at": job.get("started_at"),
+        "requested_size": job.get("requested_size"),
+        "requested_count": job.get("requested_count", 1), "started_at": job.get("started_at"),
         "pid": job.get("pid"), "error": job.get("error"),
         "message": (
             "Background image job is still running; poll this job again and do not resubmit."
@@ -2565,6 +2572,9 @@ def command_models(args: argparse.Namespace) -> int:
             ],
             "selection_token": selection_token,
             "selection_required": True,
+            "output_count_choices": list(range(1, OUTPUT_MAX_COUNT + 1)),
+            "default_output_count": 1,
+            "max_output_count": OUTPUT_MAX_COUNT,
             "preferred_sizes": list(CONSERVATIVE_SIZES),
             "experimental_sizes": list(EXPERIMENTAL_SIZES),
             "four_k_notice": (
@@ -2635,32 +2645,66 @@ def command_run(args: argparse.Namespace) -> int:
         candidates = []
         phase = "request"
         try:
-            if route_kind == "chat":
-                response, endpoint_label = attempt_chat(
-                    client, args.prompt, model, size, references, custom_url
-                )
-            elif route_kind == "images":
-                response, endpoint_label = attempt_images(
-                    client, args.prompt, model, size, references, custom_url
-                )
-            else:
-                raise ClientError(f"Unsupported endpoint kind: {route_kind}")
+            saved: list[dict[str, Any]] = []
+            partial_failures: list[str] = []
+            batch_refused = False
+            # Chat's n counts reply candidates, not output images. Request one
+            # image at a time without feeding generated outputs into later edits.
+            for _ in range(args.count if route_kind == "chat" else 1):
+                response = None
+                candidates = []
+                phase = "request"
+                try:
+                    if route_kind == "chat":
+                        response, endpoint_label = attempt_chat(
+                            client, args.prompt, model, size, references, custom_url
+                        )
+                    elif route_kind == "images":
+                        response, endpoint_label = attempt_images(
+                            client, args.prompt, model, size, references, custom_url,
+                            count=args.count,
+                        )
+                    else:
+                        raise ClientError(f"Unsupported endpoint kind: {route_kind}")
 
-            candidates = extract_image_candidates(response)
-            phase = "no_image_in_response" if not candidates else "image_download_or_decode"
-            saved, partial_failures = save_candidates(
-                candidates, client, output_dir, model, endpoint_label
-            )
+                    candidates = extract_image_candidates(response)
+                    phase = "no_image_in_response" if not candidates else "image_download_or_decode"
+                    remaining = args.count - len(saved)
+                    if len(candidates) > remaining:
+                        partial_failures.append("The provider returned more image candidates than requested; only the requested number was retained.")
+                    batch, failures = save_candidates(
+                        candidates, client, output_dir, model, endpoint_label, limit=remaining
+                    )
+                    saved.extend(batch)
+                    partial_failures.extend(failures)
+                    if failures or len(saved) >= args.count:
+                        break
+                except ClientError as error:
+                    if not saved:
+                        raise
+                    batch_refused = isinstance(error, RefusalError)
+                    attempts.append({
+                        "endpoint": endpoint_label, "error": str(error),
+                        "phase": "provider_refusal" if batch_refused else phase,
+                        "elapsed_seconds": round(time.monotonic() - started, 3),
+                        "candidate_count": len(candidates),
+                    })
+                    partial_failures.append("The multi-image request stopped after an error; saved images were retained and no replacement request was submitted.")
+                    break
             first_path = Path(saved[0]["path"])
 
             warnings: list[str] = list(prepared_input["reference_warnings"])
             if prepared_input["prompt_info"]["compacted"]:
                 warnings.append("Conversation wrappers were removed from the edit prompt; only current edit instructions were sent.")
-            if attempts:
+            if any(item["endpoint"] != endpoint_label for item in attempts):
                 warnings.append(
                     f"Succeeded through {endpoint_label} after earlier endpoint failure."
                 )
             warnings.extend(partial_failures)
+            if len(saved) < args.count:
+                warnings.append(f"Requested {args.count} images, but only {len(saved)} were saved. The requested count was not completed; no automatic top-up or endpoint fallback was performed after saving an image.")
+            if batch_refused:
+                warnings.append("The provider refused a later image in this batch; no further images were requested.")
             warnings.extend(check_output_dimensions(saved, size))
             if endpoint_label == "chat" and size not in CONSERVATIVE_SIZES:
                 warnings.append(
@@ -2675,6 +2719,10 @@ def command_run(args: argparse.Namespace) -> int:
                     "model": model,
                     "endpoint": endpoint_label,
                     "requested_size": size,
+                    "requested_count": args.count,
+                    "returned_count": len(saved),
+                    "count_complete": len(saved) == args.count,
+                    "provider_refused": batch_refused,
                     "size_source": prepared_input.get("size_source"),
                     "reference_source": reference_source,
                     "references": prepared_input["references"],
@@ -2725,6 +2773,7 @@ def command_run(args: argparse.Namespace) -> int:
             "error": "The provider refused this request; no new image was saved." if refused else "Image request failed; no new image was saved. See attempts for endpoint errors.",
             "current_request_succeeded": False,
             "provider_refused": refused,
+            "requested_count": args.count, "returned_count": 0, "count_complete": False,
             "model": model,
             "requested_size": size,
             "reference_source": reference_source,
@@ -2746,6 +2795,8 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompt", required=True)
     parser.add_argument("--model")
     parser.add_argument("--selection-token")
+    parser.add_argument("--count", type=int, default=1,
+                        help="Output image count (1-4, default 1); ask together with model selection.")
     parser.add_argument("--image", action="append", default=[])
     parser.add_argument("--use-last", action="store_true")
     parser.add_argument(
@@ -2817,6 +2868,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def validate_args(args: argparse.Namespace) -> None:
     is_request = getattr(args, "command", None) in {"run", "start"}
+    if is_request and not 1 <= args.count <= OUTPUT_MAX_COUNT:
+        raise ClientError(f"--count must be between 1 and {OUTPUT_MAX_COUNT}. No request was sent.")
     if is_request and not args.prompt.strip():
         raise ClientError("A non-empty --prompt is required. No request was sent.")
     if is_request and not args.model:

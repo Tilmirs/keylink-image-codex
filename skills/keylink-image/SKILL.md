@@ -23,12 +23,12 @@ For edits, compose a concise prompt from the current requested changes, required
 
 The client inspects reference image bytes and dimensions before sending either endpoint. Accept at most 15 references, each at most 1 MiB after preparation; they do not share a 1 MiB budget. Preserve compliant smaller files byte-for-byte. A lower server-published total budget may require further compression, starting with the largest uploads. Excess image counts stop before submission; ask the user to choose fewer images instead of silently dropping any. The client creates upload copies when needed and snapshots all references for detached jobs. Pass original uploaded/saved image paths; never substitute display previews. Pillow is required for resizing, compression, orientation correction, or unsupported input formats. If unavailable and a reference needs conversion, install it into the launcher's Python environment before retrying. Explain normalization using `reference_images` and warnings; requested output pixels stay unchanged. Read [references/routing.md](references/routing.md) for client budgets and published input limits.
 
-## Choose model, size, and endpoint
+## Choose model, count, size, and endpoint
 
 - Before every new generation or edit, run `models`. It calls `GET /v1/models`, saves a one-use selection token for the current Codex task, and reports server-published sizes.
-- Show the returned `image_models` to the user and wait for the user to choose one. Never choose a model automatically, silently reuse the previous model, or start an image request in the same turn as model discovery unless the user already replied with a choice from that exact discovery result.
-- Pass the chosen model unchanged with `--model` and pass the returned token with `--selection-token`. The client rejects missing, stale, reused, wrong-task, wrong-host, and unlisted model selections. A new generation or edit requires a fresh `models` call and a fresh user choice.
-- Correcting the same request after input preflight fails (for example, an invalid reference path or rejected edit prompt) is not a new generation. If no job has started and the selection token is still unused and current, keep the chosen model, token, and confirmed size, fix the input, and retry without calling `models` or asking for the same model again. For an existing job, check `status`; never reset or bypass a consumed/replaced token.
+- Show the returned `image_models` and ask for the model and output count together in the same interaction. Offer 1, 2, 3, or 4 images (default 1); for example: "请选择模型和生成数量（1～4 张，默认 1 张），可回复：模型名，3 张。" If the user already specified a valid count, show that choice alongside the model question instead of asking it again. A reply containing only a model keeps a count already specified for this request; otherwise it accepts the stated default count of 1. For more than 4, ask the user to choose 1–4 before submitting; never silently clamp or split into additional batches. Wait for the user to choose a model. Never choose a model automatically, silently reuse the previous model, or start an image request in the same turn as model discovery unless the user already replied with a choice from that exact discovery result.
+- Pass the chosen model unchanged with `--model`, the chosen count with `--count`, and the returned token with `--selection-token`. The client rejects missing, stale, reused, wrong-task, wrong-host, and unlisted model selections. A new generation or edit requires a fresh `models` call and a fresh user choice.
+- Correcting the same request after input preflight fails (for example, an invalid reference path or rejected edit prompt) is not a new generation. If no job has started and the selection token is still unused and current, keep the chosen model, count, token, and confirmed size, fix the input, and retry without calling `models` or asking for the same model again. For an existing job, check `status`; never reset or bypass a consumed/replaced token.
 - Prefer `1024x1024`, `1536x1024`, or `1024x1536` for `gpt-image-2`, the `gpt-image-2.5` family (including `sunburst` and `flare`), and supported Gemini image models. Choose among them from the requested aspect ratio. Read sizes for the exact selected model ID; do not inherit published sizes from its base model or another variant. Do not assume `2048x2048` when the catalog does not publish it.
 - `gemini-nano-banana-2.1` is a recognized Gemini image model even when its catalog entry has no image capability metadata. Offer it only when the current catalog returns that exact ID; preserve it in generation, reference edits, and continued edits. Use Images first, then Chat, with the same size rules as other Gemini image models; an explicitly selected endpoint stays fixed.
 - Treat "更高分辨率", "高分辨率", "高清", "超高清", "2K", "4K", "UHD", or an explicitly larger pixel size as high-resolution intent. Show the published sizes plus relevant experimental candidates such as `2560x1440` and `3840x2160`, then wait for user confirmation before running the image request.
@@ -37,7 +37,9 @@ The client inspects reference image bytes and dimensions before sending either e
 - Use `--endpoint auto` unless the user explicitly fixes `images`, `chat`, or a custom endpoint. Explicit endpoint choices never fall back.
 - For custom endpoints, pass `--endpoint custom --custom-url <url> --custom-kind chat|images`.
 
-Read [references/routing.md](references/routing.md) when endpoint order, high-resolution handling, or response compatibility affects the request.
+Output count is separate from reference-image count. Images Generations/Edits send the chosen count as `n`; Chat requests one output at a time, up to that count, with the same prompt, model, size, and input references. Keep quantity instructions out of the creative prompt: do not ask for a collage to simulate multiple files. Use detached `start` for multiple outputs as well as high-resolution requests. Tell the user that several images can take longer. All outputs belong to one selection token and one job; never repeat `start` while it is running. If the user later asks to edit an unspecified image from a multi-image result, ask which output they mean, then pass its original path with `--image`.
+
+Read [references/routing.md](references/routing.md) when endpoint order, multi-image handling, high-resolution handling, or response compatibility affects the request.
 
 ## Run the client
 
@@ -45,18 +47,20 @@ Use JSON output to determine the saved image path and warnings:
 
 ```powershell
 & "<skill-dir>\scripts\keylink-image.ps1" models
-& "<skill-dir>\scripts\keylink-image.ps1" run --prompt "..." --model "gpt-image-2" --selection-token "<token-from-models>" --aspect landscape --endpoint auto
+& "<skill-dir>\scripts\keylink-image.ps1" run --prompt "..." --model "gpt-image-2" --count 1 --selection-token "<token-from-models>" --aspect landscape --endpoint auto
 & "<skill-dir>\scripts\keylink-image.ps1" run --prompt "change only the sky to sunset" --model "gpt-image-2" --selection-token "<fresh-token>" --use-last
 & "<skill-dir>\scripts\keylink-image.ps1" run --prompt "..." --model "gemini-3.1-flash-image" --selection-token "<fresh-token>" --image "C:\path\reference.png"
 & "<skill-dir>\scripts\keylink-image.ps1" start --prompt "..." --model "gpt-image-2.5" --selection-token "<fresh-token>" --size "3840x2160" --confirm-high-res
 & "<skill-dir>\scripts\keylink-image.ps1" status --thread-id "<thread-id>" --job-id "<job-id-from-start>"
 ```
 
+For multiple outputs, use `start ... --count 4` (or 2/3), then query the returned job with `status`.
+
 On macOS/Linux, use the same arguments with the shell launcher, keeping paths quoted:
 
 ```sh
 sh "<skill-dir>/scripts/keylink-image.sh" models
-sh "<skill-dir>/scripts/keylink-image.sh" run --prompt "..." --model "gpt-image-2" --selection-token "<token-from-models>" --aspect landscape
+sh "<skill-dir>/scripts/keylink-image.sh" run --prompt "..." --model "gpt-image-2" --count 1 --selection-token "<token-from-models>" --aspect landscape
 sh "<skill-dir>/scripts/keylink-image.sh" run --prompt "change only the sky to sunset" --model "gpt-image-2" --selection-token "<fresh-token>" --use-last
 sh "<skill-dir>/scripts/keylink-image.sh" run --prompt "..." --model "gemini-3.1-flash-image" --selection-token "<fresh-token>" --image "/Users/name/Pictures/reference image.png"
 sh "<skill-dir>/scripts/keylink-image.sh" start --prompt "..." --model "gpt-image-2.5" --selection-token "<fresh-token>" --size "3840x2160" --confirm-high-res
@@ -79,13 +83,14 @@ The latest successful image is stored under `.keylink-image/threads/<thread-id>/
 
 ## Return the result
 
+- Report `returned_count` against `requested_count` and display every saved image. `count_complete: false` means only part of the requested count was saved, even when `status` is `ok`. Do not call the whole batch complete. Preserve those files; do not automatically top up, switch endpoints, or reuse the token after any image has been saved. A later refusal stops the remaining calls; report the refusal and return only the images already saved before it.
 - Display each image using the returned `display_markdown` and include its `original_markdown` link. Paths use forward slashes and angle brackets for Windows/space compatibility.
 - Large images get a separate JPEG display preview when Pillow is available. This preview is only for inspection/display; the original file and its actual dimensions remain the deliverable and the reference for subsequent edits. Never pass the preview as the next reference image.
 - If `view_image` fails with `invalid base64`, `Invalid padding`, or an oversized payload, use `display_path`. A preview error does not mean generation failed; still return the saved original link, without sending a new image request.
 - Include the model, endpoint actually used, requested size, and detected pixel size when available.
 - Check each image's `matches_requested_size`. If false, explain that the provider returned different pixel dimensions and deliver the saved original with its actual dimensions; do not label it as matching the request, resize it locally, or automatically submit another generation. Upload compression alone does not determine the requested output pixels; inspect `size_source`, `reference_images`, and `requested_size` separately.
 - Wait for the actual command/session result before declaring success. A tool call returning a running session is not a completed generation. Only return images from this request's successful `run` result or matching completed job; a content refusal or API failure must be reported as failure, never replaced with an input image or an earlier successful result.
-- `provider_refused: true` means the provider explicitly blocked the request. Report that no new image was generated; do not automatically switch endpoints/models or rewrite the prompt to evade that refusal.
+- `provider_refused: true` means the provider explicitly blocked a request. If `returned_count` is 0, report that no new image was generated. If earlier calls in this batch saved images, report the partial count and that the remaining request was refused; do not automatically switch endpoints/models or rewrite the prompt to evade that refusal.
 - If both automatic endpoints fail, summarize both errors and ask whether to switch models. Do not switch models before the user agrees.
 - Distinguish HTTP/API errors (including 400/413), connection failures, a successful response without an image, and a returned image that failed to download/decode. Inspect `attempts`, `request_attempts`, and `prompt_info`; do not describe an HTTP/API rejection as a missing image link. A client upload budget reduces oversized requests but cannot guarantee acceptance by an undocumented channel limit.
 - If the user explicitly fixed an endpoint, report that endpoint's failure without trying another one.

@@ -22,7 +22,7 @@ If no account login is detected, API-key-only Codex/Codex++ auth/config files an
 | `gemini-nano-banana-2.1` | Images Generations, then Chat | Images Edits, then Chat |
 | Other pass-through model IDs | Images, then Chat | Images Edits, then Chat |
 
-Automatic fallback occurs for HTTP errors, successful responses with no image, and image download or decoding failures. Both endpoints use the same model ID, cleaned prompt, requested output size, and prepared references. Explicit `images`, `chat`, and custom endpoint modes stay on that endpoint.
+Automatic fallback occurs for HTTP errors, successful responses with no image, and image download or decoding failures. Both endpoints use the same model ID, cleaned prompt, requested output size, selected count, and prepared references. Explicit `images`, `chat`, and custom endpoint modes stay on that endpoint.
 
 The `gpt-image-2.5` variants are distinct pass-through IDs, not aliases for `gpt-image-2.5` or `gpt-image-2`. Display only models returned by the current catalog, preserve variant suffixes in every request and saved result, and read published sizes from each variant's own catalog entry. New model names alone do not imply new size support or different API fields.
 
@@ -54,6 +54,10 @@ Pillow validates references and produces separate PNG/JPEG upload copies when ne
 
 Before every new generation or edit, `models` must query `GET /v1/models` and the user must choose from the returned catalog. `run` and `start` require the one-use selection token returned by that query. Tokens are bound to the Codex task and API host and cannot be reused for another image request. If input preflight fails before any job starts and while the token is still unused and current, correct the same request with that token and chosen model; do not refresh the catalog or ask for the same choice again. Check `status` for an existing job, and never reset a used token.
 
+`models` also returns `output_count_choices: [1, 2, 3, 4]`, `default_output_count: 1`, and `max_output_count: 4`. Ask for model and count together; pass `--count` to `run`/`start`. The client defaults to 1 for backward compatibility and rejects counts outside 1–4 before credentials, POSTs, token consumption, or background launch. This is the Skill limit, not a claim about a provider's maximum.
+
+Images Generations uses JSON `n`; Images Edits uses multipart `n`. Chat's `n` is not an image count, so the client makes single-output calls until the chosen count is saved, using identical creative prompt and input references each time. One selection token authorizes this single bounded operation. Automatic fallback remains Images → Chat only before any image is saved. Stop after a partial download failure, a short Images response, or a later Chat error/refusal; return saved images and `requested_count`, `returned_count`, `count_complete` without automatic top-ups. All failed/zero-image endpoints still use the normal fallback policy, and explicit endpoints remain fixed. Detached workers and local recovery preserve the count metadata and all saved images.
+
 The conservative size set is:
 
 - `1024x1024`
@@ -66,7 +70,7 @@ For editing, omitted `--size` and `--aspect` inherit the original reference dime
 
 When the user requests higher resolution, fetch the model catalog first. Present the server-published sizes and label `2560x1440` or `3840x2160` as attempts that the channel may reject when they are not published. Confirmation is required before passing a non-conservative size to `start`.
 
-Before sending `2560x1440` or `3840x2160`, tell the user that high-resolution generation can take several minutes and ask them to wait patiently. Start these requests with the detached job command and poll its status. The worker owns the single API request and writes the result after the Codex turn ends; never submit the same selection again.
+Before sending `2560x1440` or `3840x2160`, tell the user that high-resolution generation can take several minutes and ask them to wait patiently. Start these requests with the detached job command and poll its status. The worker owns this single job (including bounded sequential Chat calls for multiple outputs) and writes the result after the Codex turn ends; never submit the same selection again.
 
 Do not claim a lower-resolution result is 2K or 4K. Do not retry a confirmed high-resolution request at a smaller size. For Chat results, requested pixel dimensions are advisory and are not guaranteed by the endpoint.
 
