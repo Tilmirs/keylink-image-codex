@@ -169,12 +169,81 @@ class CredentialTests(unittest.TestCase):
                 self.write_json(self.root / ".codex++/auth.json", data)
                 self.assertEqual(client.discover_codex_account_login(), expected)
 
-    def test_stopped_ccswitch_does_not_reuse_saved_key_when_account_signed_in(self):
+    def test_saved_legacy_key_works_when_stopped_or_unknown_without_auth_fallback(self):
         self.account()
         self.database([("keylink", 1, "saved-key", client.DEFAULT_BASE_URL)])
-        with mock.patch.object(client, "ccswitch_process_is_running", return_value=False):
-            with self.assertRaises(client.CodexAccountCredentialError):
-                self.resolve()
+        path = self.cc / "cc-switch.db"
+        original = path.read_bytes()
+        for running in (False, None):
+            with self.subTest(running=running), mock.patch.object(
+                client, "ccswitch_process_is_running", return_value=running
+            ), mock.patch.object(client, "discover_codex_account_login", side_effect=AssertionError("No account scan")):
+                self.assertEqual(self.resolve(), ("saved-key", "ccswitch-saved-provider"))
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_saved_aggregation_survives_ui_exit_and_probe_denial(self):
+        self.account(OPENAI_API_KEY="wrong-account-key")
+        self.database([("official", 1, None, "https://api.openai.com"),
+                       ("other", 0, "wrong-provider-key", "https://other.example"),
+                       ("keylink", 0, "saved-member-key", client.DEFAULT_BASE_URL)])
+        self.aggregate(["official", "other", "keylink"])
+        files = [self.cc / "cc-switch.db", self.cc / "live-state.json"]
+        original = [path.read_bytes() for path in files]
+        for running in (True, False, None):
+            with self.subTest(running=running), mock.patch.object(
+                client, "ccswitch_process_is_running", return_value=running
+            ), mock.patch.object(client, "discover_codex_account_login", side_effect=AssertionError("No account scan")):
+                expected = "ccswitch-aggregation-provider" if running is True else "ccswitch-saved-aggregation-provider"
+                self.assertEqual(self.resolve(), ("saved-member-key", expected))
+        self.assertEqual([path.read_bytes() for path in files], original)
+
+    def test_offline_selection_keeps_aggregation_membership_and_host_checks(self):
+        self.account()
+        self.database([("official", 1, None, "https://api.openai.com"),
+                       ("retired", 0, "retired-key", client.DEFAULT_BASE_URL),
+                       ("wrong", 0, "wrong-key", "https://keylinkclub.com.unrelated.example")])
+        for mode, enabled, members in (("proxy", True, []), ("direct", True, ["retired"]),
+                                      ("proxy", False, ["retired"]), ("proxy", True, ["wrong"])):
+            self.aggregate(members, mode=mode, enabled=enabled)
+            for running in (False, None):
+                with self.subTest(mode=mode, enabled=enabled, members=members, running=running), mock.patch.object(
+                    client, "ccswitch_process_is_running", return_value=running
+                ):
+                    error_type = client.CodexAccountCredentialError if running is False else client.CCSwitchDetectionRequired
+                    with self.assertRaises(error_type):
+                        self.resolve(confirm=True)
+
+    def test_offline_ambiguous_members_still_require_explicit_selection(self):
+        self.database([("official", 1, None, "https://api.openai.com"),
+                       ("one", 0, "first-key", client.DEFAULT_BASE_URL),
+                       ("two", 0, "second-key", client.DEFAULT_BASE_URL)])
+        for running in (False, None):
+            with self.subTest(running=running), mock.patch.object(
+                client, "ccswitch_process_is_running", return_value=running
+            ):
+                self.aggregate(["one", "two"])
+                with self.assertRaisesRegex(client.ClientError, "Multiple"):
+                    self.resolve()
+                self.aggregate(["one", "two"], route="two")
+                self.assertEqual(self.resolve(), ("second-key", "ccswitch-saved-aggregation-provider"))
+
+    def test_models_uses_saved_member_key_without_exposing_it(self):
+        self.account()
+        self.database([("official", 1, None, "https://api.openai.com"),
+                       ("keylink", 0, "private-saved-key", client.DEFAULT_BASE_URL)])
+        self.aggregate(["official", "keylink"])
+        for running in (False, None):
+            with self.subTest(running=running), mock.patch.object(
+                client, "ccswitch_process_is_running", return_value=running
+            ), mock.patch.object(client, "HttpClient") as http, mock.patch.object(
+                client, "model_catalog", return_value=[{"id": "gpt-image-2"}]
+            ), contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(client.main(["models"]), 0)
+                self.assertEqual(http.call_args.args[:2], (client.DEFAULT_BASE_URL, "private-saved-key"))
+                result = json.loads(output.getvalue())
+                self.assertEqual(result["credential_source"], "ccswitch-saved-aggregation-provider")
+                self.assertNotIn("private-saved-key", output.getvalue())
+                http.return_value.request_multipart.assert_not_called()
 
     def test_manual_key_wins_even_when_account_signed_in(self):
         self.account()
@@ -276,13 +345,15 @@ class DetectionTests(unittest.TestCase):
             ):
                 self.assertIs(client.discover_ccswitch_state().running, expected)
 
-    def test_unknown_state_never_reuses_stale_key_or_scans_account(self):
+    def test_unknown_state_without_matching_saved_host_never_scans_account(self):
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(
             client, "discover_codex_account_login", side_effect=AssertionError("No credential fallback")
         ):
-            for key in (None, "private-stale-key"):
-                state = client.CCSwitchState(running=None, api_key=key, provider_base_urls=[client.DEFAULT_BASE_URL])
-                with self.subTest(has_key=bool(key)), self.assertRaises(client.CCSwitchDetectionRequired):
+            for key, urls in ((None, [client.DEFAULT_BASE_URL]), ("private-stale-key", []),
+                              ("private-stale-key", ["http://localhost:12345"]),
+                              ("private-stale-key", ["https://unrelated.example"])):
+                state = client.CCSwitchState(running=None, api_key=key, provider_base_urls=urls)
+                with self.subTest(has_key=bool(key), urls=urls), self.assertRaises(client.CCSwitchDetectionRequired):
                     client.discover_api_key(client.DEFAULT_BASE_URL, "default", state, confirm_codex_auth=True)
 
     def test_models_returns_host_retry_and_sends_no_request_when_detection_blocked(self):

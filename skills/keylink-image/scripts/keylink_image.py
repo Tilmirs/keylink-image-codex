@@ -49,6 +49,11 @@ DEFAULT_MODEL_PRIORITY = (
 CONSERVATIVE_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 EXPERIMENTAL_SIZES = ("2560x1440", "3840x2160")
 OUTPUT_MAX_COUNT = 4
+PROMPT_MODES = (
+    {"id": "restrained", "label": "克制模式", "description": "完全使用用户提示词，不做任何修改"},
+    {"id": "creative", "label": "创意模式", "description": "以用户提示词为基础，补充模糊语句，做简短修饰"},
+    {"id": "master", "label": "大师模式", "description": "保留用户目标和硬性要求，全面优化提示词后生成"},
+)
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
 DATA_URL_RE = re.compile(
     r"data:(image/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/_-]+(?:\r?\n[A-Za-z0-9+/_-]+)*={0,2})", re.I
@@ -152,14 +157,15 @@ class CodexAccountCredentialError(ClientError):
         )
         super().__init__(
             "Codex/Codex++ account login detected. " + context
-            + "Manually configure the Keylink provider in CCSwitch and keep it running, "
+            + "Manually configure and save the Keylink provider in CCSwitch "
+            "(add it to aggregation when enabled), "
             "or set KEYLINK_API_KEY. Account auth.json and OPENAI_API_KEY will not be used; "
             "--confirm-codex-auth cannot override account login."
         )
 
 
 class CCSwitchDetectionRequired(ClientError):
-    """Sandbox restrictions are not evidence that CCSwitch is stopped."""
+    """No matching saved key is available and live state cannot be checked."""
 
     def __init__(self) -> None:
         self.payload = {
@@ -174,7 +180,8 @@ class CCSwitchDetectionRequired(ClientError):
         super().__init__(
             "CCSwitch running state could not be checked: process enumeration or the local "
             "listener probe was denied, unavailable, or timed out. Retry with approved host "
-            "execution; no credential was selected and no API request was sent."
+            "execution; no matching saved Keylink credential was available, "
+            "no credential was selected and no API request was sent."
         )
 
 
@@ -663,22 +670,28 @@ def discover_api_key(
             raise ClientError("KEYLINK_API_KEY contains a CCSwitch placeholder. Configure a real Keylink API key.")
         return value.strip(), "environment:KEYLINK_API_KEY"
 
-    if ccswitch.running is None:
-        raise CCSwitchDetectionRequired()
-
-    # Discovery resolves the active provider/member for this API host. A working
-    # CCSwitch credential takes priority without reading account login files.
-    if ccswitch.running and ccswitch.credential_error:
+    # Saved provider/member selection is independent of the UI process. Require
+    # a matching remote host before using a saved key without a running probe.
+    # This never treats a saved database as evidence that CCSwitch is running.
+    if ccswitch.credential_error:
         raise ClientError(ccswitch.credential_error)
     provider_hosts = {
         normalized_host(url) for url in ccswitch.provider_base_urls
         if normalized_host(url) and not is_loopback(url)
     }
-    selected_host_matches = normalized_host(base_url) in provider_hosts or (
-        not provider_hosts and normalized_host(base_url) == normalized_host(DEFAULT_BASE_URL)
+    selected_host_matches = normalized_host(base_url) in provider_hosts
+    legacy_running_match = (
+        ccswitch.running is True and not provider_hosts
+        and normalized_host(base_url) == normalized_host(DEFAULT_BASE_URL)
     )
-    if ccswitch.running and ccswitch.api_key and selected_host_matches:
-        return ccswitch.api_key, ccswitch.credential_source
+    if ccswitch.api_key and (selected_host_matches or legacy_running_match):
+        source = ccswitch.credential_source
+        if ccswitch.running is not True:
+            source = "ccswitch-saved-aggregation-provider" if ccswitch.aggregation else "ccswitch-saved-provider"
+        return ccswitch.api_key, source
+
+    if ccswitch.running is None:
+        raise CCSwitchDetectionRequired()
 
     if discover_codex_account_login():
         raise CodexAccountCredentialError(ccswitch_running=bool(ccswitch.running))
@@ -1028,7 +1041,7 @@ def extract_current_prompt(prompt: str) -> str:
     return value
 
 
-def sanitize_edit_prompt(prompt: str) -> tuple[str, dict[str, Any]]:
+def sanitize_edit_prompt(prompt: str, *, preserve_text: bool = False) -> tuple[str, dict[str, Any]]:
     value = extract_current_prompt(prompt)
     # Remove explicitly tagged non-prompt material, not arbitrary prose or code
     # the user may want depicted in the image.
@@ -1036,7 +1049,16 @@ def sanitize_edit_prompt(prompt: str) -> tuple[str, dict[str, Any]]:
         r"<(context|history|system|developer|tool_result|environment_context)(?:\s[^>]*)?>"
         r".*?</\1>", "", value, flags=re.S | re.I,
     ).strip()
-    value = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", value)
+    if preserve_text:
+        if value != prompt.strip():
+            raise ClientError(
+                "The selected prompt mode requires a clean final edit prompt. "
+                "Conversation wrappers would change its text. Supply only the visual "
+                "instructions; no prompt was rewritten and no request was sent."
+            )
+        value = prompt  # Preserve even whitespace in an explicitly prepared prompt.
+    else:
+        value = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)+", "\n\n", value)
     if not value:
         raise ClientError("The edit prompt is empty after removing conversation wrappers. Supply only the requested changes; no request was sent.")
     if EDIT_ROLE_LINE_RE.search(value) or EDIT_CONTEXT_LINE_RE.search(value):
@@ -1049,7 +1071,7 @@ def sanitize_edit_prompt(prompt: str) -> tuple[str, dict[str, Any]]:
     if "data:image/" in value.lower():
         raise ClientError("Pass reference images through --image, not Base64 inside the edit prompt; no request was sent.")
     return value, {
-        "compacted": value != prompt.strip(), "original_chars": len(prompt),
+        "compacted": False if preserve_text else value != prompt.strip(), "original_chars": len(prompt),
         "sent_chars": len(value), "sent_bytes": len(value.encode("utf-8")),
     }
 
@@ -1542,7 +1564,9 @@ def prepare_request_inputs(
         source = "last-successful-image" if args.use_last or args.mode == "edit" else "auto-correction-last-image"
     # Explicit references (including --use-last) determine the image operation.
     # generate only disables implicit reuse based on correction wording.
-    prompt, info = sanitize_edit_prompt(args.prompt) if references else (args.prompt, {
+    prompt, info = sanitize_edit_prompt(
+        args.prompt, preserve_text=getattr(args, "prompt_mode", None) is not None,
+    ) if references else (args.prompt, {
         "compacted": False, "original_chars": len(args.prompt),
         "sent_chars": len(args.prompt), "sent_bytes": len(args.prompt.encode("utf-8")),
     })
@@ -1554,6 +1578,7 @@ def prepare_request_inputs(
     size = validate_size_request(args, preparation.items)
     return {
         "prompt": prompt, "prompt_info": info, "reference_source": source,
+        "prompt_mode": getattr(args, "prompt_mode", None),
         "requested_size": size,
         "size_source": ("explicit-size" if args.size else "explicit-aspect" if args.aspect
                         else "original-reference" if references else "default-square"),
@@ -2059,11 +2084,13 @@ def validate_size_request(args: argparse.Namespace, reference_images: list[dict[
 
 def run_argv(args: argparse.Namespace, thread_id: str) -> list[str]:
     result = [
-        "run", "--prompt", args.prompt, "--model", args.model,
+        "run", "--prompt=" + args.prompt, "--model", args.model,
         "--selection-token", args.selection_token, "--mode", args.mode,
         "--endpoint", args.endpoint, "--count", str(args.count),
         "--thread-id", thread_id, "--timeout", str(args.timeout),
     ]
+    if getattr(args, "prompt_mode", None):
+        result.extend(("--prompt-mode", args.prompt_mode))
     for path in args.image:
         result.extend(("--image", path))
     if args.use_last:
@@ -2282,6 +2309,7 @@ def command_start(args: argparse.Namespace) -> int:
         "job_id": job_id, "status": "starting", "thread_id": thread_id,
         "request_id": image_request_id(args.selection_token),
         "model": args.model, "requested_size": size, "requested_count": args.count,
+        "prompt_mode": prepared_input.get("prompt_mode"),
         "started_at": started_at,
         "cwd": request["cwd"],
     }
@@ -2348,6 +2376,8 @@ def command_start(args: argparse.Namespace) -> int:
         "requested_size": size, "requested_count": args.count, "started_at": started_at,
         "size_source": prepared_input.get("size_source"),
         "prompt_info": prepared_input["prompt_info"],
+        "prompt_mode": prepared_input.get("prompt_mode"),
+        "prepared_prompt": prepared_input["prompt"],
         "reference_images": prepared_input["reference_images"],
         "warnings": prepared_input["reference_warnings"],
         "status_args": ["status", "--job-id", job_id, "--thread-id", thread_id],
@@ -2448,6 +2478,7 @@ def command_status(args: argparse.Namespace) -> int:
         "status": status, "background": True, "job_id": job_id,
         "historical": not current, "current_request_succeeded": False,
         "thread_id": thread_id, "model": job.get("model"),
+        "prompt_mode": job.get("prompt_mode"),
         "requested_size": job.get("requested_size"),
         "requested_count": job.get("requested_count", 1), "started_at": job.get("started_at"),
         "pid": job.get("pid"), "error": job.get("error"),
@@ -2575,6 +2606,8 @@ def command_models(args: argparse.Namespace) -> int:
             "output_count_choices": list(range(1, OUTPUT_MAX_COUNT + 1)),
             "default_output_count": 1,
             "max_output_count": OUTPUT_MAX_COUNT,
+            "prompt_mode_choices": list(PROMPT_MODES),
+            "prompt_mode_required": True,
             "preferred_sizes": list(CONSERVATIVE_SIZES),
             "experimental_sizes": list(EXPERIMENTAL_SIZES),
             "four_k_notice": (
@@ -2729,6 +2762,8 @@ def command_run(args: argparse.Namespace) -> int:
                     "reference_images": prepared_input["reference_images"],
                     "reference_limit_source": prepared_input["reference_limit_source"],
                     "prompt_info": prepared_input["prompt_info"],
+                    "prompt_mode": prepared_input.get("prompt_mode"),
+                    "sent_prompt": args.prompt,
                     "request_attempts": client.request_attempts,
                     "thread_id": thread_id,
                     "base_url": base_url,
@@ -2780,6 +2815,9 @@ def command_run(args: argparse.Namespace) -> int:
             "reference_images": prepared_input["reference_images"],
             "reference_limit_source": prepared_input["reference_limit_source"],
             "prompt_info": prepared_input["prompt_info"],
+            "prompt_mode": prepared_input.get("prompt_mode"),
+            **({"sent_prompt": args.prompt} if client.last_request_bytes is not None
+               else {"prepared_prompt": args.prompt}),
             "request_attempts": client.request_attempts,
             "warnings": prepared_input["reference_warnings"],
             "base_url": base_url,
@@ -2792,7 +2830,15 @@ def command_run(args: argparse.Namespace) -> int:
 
 
 def add_run_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--prompt", required=True)
+    prompt = parser.add_mutually_exclusive_group(required=True)
+    prompt.add_argument("--prompt")
+    prompt.add_argument("--prompt-file", help="Read the exact final prompt from a UTF-8 file; avoids shell quoting changes.")
+    parser.add_argument(
+        "--prompt-mode", choices=tuple(mode["id"] for mode in PROMPT_MODES),
+        help="Prompt mode selected with Codex: restrained, creative, or master. "
+             "Codex prepares --prompt; this client never calls a text model or "
+             "semantically rewrites it. Omit for legacy edit-wrapper cleanup.",
+    )
     parser.add_argument("--model")
     parser.add_argument("--selection-token")
     parser.add_argument("--count", type=int, default=1,
@@ -2870,6 +2916,12 @@ def validate_args(args: argparse.Namespace) -> None:
     is_request = getattr(args, "command", None) in {"run", "start"}
     if is_request and not 1 <= args.count <= OUTPUT_MAX_COUNT:
         raise ClientError(f"--count must be between 1 and {OUTPUT_MAX_COUNT}. No request was sent.")
+    if is_request and getattr(args, "prompt_file", None) is not None:
+        try:
+            # Ignore an optional encoding signature, preserving content and CRLF.
+            args.prompt = Path(args.prompt_file).expanduser().read_bytes().decode("utf-8-sig")
+        except (OSError, UnicodeError) as error:
+            raise ClientError(f"Cannot read --prompt-file as UTF-8: {error}. No request was sent.") from error
     if is_request and not args.prompt.strip():
         raise ClientError("A non-empty --prompt is required. No request was sent.")
     if is_request and not args.model:

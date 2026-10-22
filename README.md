@@ -22,7 +22,8 @@
 
 ## 功能
 
-- 每次生成或编辑前调用 `GET /v1/models`，同一步询问模型与生成数量（1～4 张，默认 1 张），等待用户选择。
+- 每次生成或编辑前调用 `GET /v1/models`，同一步询问模型、生成数量（1～4 张，默认 1 张）、设计内容/风格，以及克制、创意或大师模式，已有信息直接沿用。
+- 按所选模式保留或优化提示词，整合海报、UI/UX、人物、商品与信息图等设计方法；返回图片时附上实际发送的提示词，后台恢复也可查看。
 - 自动路由统一优先 Images：文生图先 `/v1/images/generations`，图生图先 `/v1/images/edits`，失败后再尝试 `/v1/chat/completions`。
 - 支持用户上传参考图，也支持按 Codex 任务复用最近一次成功图片继续修改。
 - 编辑时清理明确的对话包装，仅发送本次修改要求；检查参考图尺寸和体积，必要时生成上传副本，保留原图与用户确认的输出分辨率。
@@ -72,20 +73,21 @@ python3 -m venv "$skill_dir/.venv"
 Skill 不会输出密钥，按以下规则选择：
 
 1. 明确配置的 `KEYLINK_API_KEY` 直接作为 Keylink 密钥使用。
-2. 检测 CCSwitch 是否真正运行。兼容旧版当前 Provider、新版路由模式和聚合模式；聚合模式从当前成员中查找 API 地址匹配的 Keylink Provider，不把默认的 OpenAI 官方账号当作 Keylink。如果有多个不同的 Keylink 密钥且默认项无法确定选择，会要求用户选择 Keylink 默认 Provider 或手动设置 `KEYLINK_API_KEY`。
-3. CCSwitch 没有可用密钥时，检查 Codex/Codex++ 是否保存了账号登录状态。**已登录账号：不从 `auth.json` 或 `OPENAI_API_KEY` 兜底**；提示用户手动配置 Keylink 密钥，启动 CCSwitch 并选择 Keylink（聚合模式需加入成员），或设置 `KEYLINK_API_KEY`。`--confirm-codex-auth` 不能绕过账号登录保护。
+2. 读取 CCSwitch 已保存的配置。兼容旧版当前 Provider、新版路由模式和聚合模式；聚合模式从已启用的成员中查找 API 地址匹配的 Keylink Provider，不把默认的 OpenAI 官方账号当作 Keylink。**软件关闭或无法检测运行状态时，只要保存的密钥匹配 Keylink 地址，仍可读取并直连使用。** 多个不同的 Keylink 密钥且默认项无法确定选择时，要求用户选择 Keylink 默认 Provider 或手动设置 `KEYLINK_API_KEY`；不会猜测。旧版仅有本地转发地址、无法确认供应商域名的配置仍要求 CCSwitch 确认运行。
+3. 没有可用的 CCSwitch 密钥且运行状态已确定时，检查 Codex/Codex++ 是否保存了账号登录状态。**已登录账号：不从 `auth.json` 或 `OPENAI_API_KEY` 兜底**；提示用户配置并保存 Keylink 密钥（聚合模式需加入成员），或设置 `KEYLINK_API_KEY`。`--confirm-codex-auth` 不能绕过账号登录保护。
 4. **未检测到账号登录：** 才检查 Codex/Codex++ 的 API Key 配置。无论 CCSwitch 未运行还是运行中但未找到密钥，都可以进入这个兜底。发现候选后先询问“这个凭据是否是 Keylink 的 Key”，用户确认后使用 `--confirm-codex-auth` 继续；否认或不确定则要求手动配置。
 
 CCSwitch 只提供真实供应商密钥，图片请求仍直连 `https://keylinkclub.com`。新版写入客户端的 `PROXY_MANAGED` 是本地路由占位值，不能用于直连；OAuth 登录令牌也不会作为 API Key 使用。Skill 只读取 CCSwitch 和 Codex 配置，不覆盖账号登录文件。
 
-**CCSwitch 已打开却提示未运行：** Codex 沙箱可能禁止查询宿主进程或连接本地监听端口。客户端现在将这种情况报告为 `ccswitch_detection_required` / `requires_host_execution`，并把运行状态标为 `null`（无法确认），不会当作未运行。Skill 会通过客户端的批准流程在宿主环境重试同一条命令；若执行权限仍不可用，会提示在自己的终端执行。无需因此重新配置密钥；也不会仅凭数据库里存在密钥就认定 CCSwitch 正在运行。
+**CCSwitch 已关闭或状态无法检测：** 客户端优先使用与目标 API 地址匹配的已保存密钥；来源为 `ccswitch-saved-provider` 或 `ccswitch-saved-aggregation-provider`，不表示软件正在运行。没有这种可用密钥且沙箱又无法查询进程/监听端口时，才返回 `ccswitch_detection_required` / `requires_host_execution`，状态为 `null`。Skill 通过客户端批准流程在宿主环境重试；权限仍不可用时提示在自己的终端执行。不会仅凭数据库文件存在就认定 CCSwitch 正在运行。
 
 | 登录状态 | CCSwitch 状态 | 处理方式（未显式设置 `KEYLINK_API_KEY` 时） |
 | --- | --- | --- |
-| 已登录 Codex 账号 | 运行且找到 Keylink 密钥 | 使用 CCSwitch 密钥 |
-| 已登录 Codex 账号 | 未运行或找不到 Keylink 密钥 | 报错并提示手动配置，不使用 `auth.json` 兜底 |
-| 未登录 Codex 账号 | 运行且找到 Keylink 密钥 | 优先使用 CCSwitch 密钥 |
-| 未登录 Codex 账号 | 未运行或找不到 Keylink 密钥 | 检查 API-key-only 配置，用户确认属于 Keylink 后使用 |
+| 已登录或未登录 Codex 账号 | 找到匹配地址的已保存 Keylink 密钥，不要求软件运行 | 优先使用 CCSwitch 密钥，不读取账号凭据 |
+| 任意登录状态 | 多个匹配密钥无法确定选择 | 提示选择 Keylink 默认 Provider 或设置 `KEYLINK_API_KEY` |
+| 已登录 Codex 账号 | 运行状态已知，但找不到可用 Keylink 密钥 | 报错并提示手动配置，不使用 `auth.json` 兜底 |
+| 未登录 Codex 账号 | 运行状态已知，但找不到可用 Keylink 密钥 | 检查 API-key-only 配置，用户确认属于 Keylink 后使用 |
+| 任意登录状态 | 没有匹配密钥，运行状态也无法检查 | 报告检测权限限制，申请宿主重试 |
 
 Codex++ 可通过 `CODEX_PLUS_HOME`、`CODEXPP_HOME` 或 `KEYLINK_CODEX_CONFIG_DIR` 指定配置目录；也支持 `CODEX_PLUS_CONFIG`、`CODEXPP_CONFIG` 和 `KEYLINK_CODEX_AUTH_FILE` 指定文件。不要把密钥写进聊天、命令参数或提交到仓库。
 
@@ -103,12 +105,12 @@ export HTTP_PROXY="$HTTPS_PROXY"
 ## 使用流程
 
 1. 调用 `GET /v1/models` 查询当前凭据可用的模型和服务端公布尺寸，展示图片模型列表。
-2. 同时询问模型与生成数量（1～4 张，默认 1 张），等待用户选择；每次新生成或编辑都重新查询、选择，选择凭证只能使用一次。同一次请求若在输入预检阶段失败、尚未启动后台任务且凭证未消耗，修正输入后复用当前凭证和已选模型，无需再次查询或选择；已有后台任务先查 `status`。
+2. 同时询问模型、生成数量（1～4 张，默认 1 张）、设计内容/用途与风格，以及提示词模式。已有信息直接沿用；未提供视觉提示词时，模式确定后再请用户描述。克制模式使用原文，创意模式补充少量细节，大师模式全面优化后发送。每次新生成或编辑都重新查询、选择模型，选择凭证只能使用一次。同一次请求若在输入预检阶段失败、尚未启动后台任务且凭证未消耗，修正输入后复用当前凭证和已选模型，无需再次查询或选择；已有后台任务先查 `status`。
 3. 确定文生图或图生图。用户新上传的参考图优先；“不满意”“把刚才的改成”等纠正意图复用当前任务最近成功的原图，仅发送本次修改要求。带参考图时使用默认 `--mode auto`；即使误传 `--mode generate`，`--image` / `--use-last` 仍按图生图处理。明确要求独立新图时不传这两个参考选项，使用 `--mode generate` 避免自动复用旧图。意图不明确时先询问。
 4. 确认尺寸。优先 `1024x1024`、`1536x1024`、`1024x1536`；高分辨率先展示服务端尺寸和可尝试候选，用户确认后才请求。
 5. 多张输出以及 `2560x1440`、`3840x2160` 使用后台作业：启动后返回 job ID，轮询状态直到保存完成。后台作业继续接收响应，即使 Codex 当前任务中断，也不能重复提交。若任务中途被中断，恢复后先执行 `status`，不要重新执行 `run`。
 6. 自动模式下按下表调用。首个端点出现 HTTP 错误、200 但没有图片、图片下载或解码失败时，使用同一模型、提示词、尺寸和参考图尝试 Chat。
-7. 成功后保存本地原图，展示图片并返回原图链接、实际模型、端点和检测到的像素尺寸。两个端点都失败才汇总错误并询问是否换模型。
+7. 成功后保存本地原图，展示图片并返回原图链接、实际模型、端点、检测到的像素尺寸，以及所选模式和实际发送的完整提示词。两个端点都失败才汇总错误并询问是否换模型。
 
 | 操作 | 第一次请求 | 失败后请求 |
 | --- | --- | --- |
@@ -118,6 +120,26 @@ export HTTP_PROXY="$HTTPS_PROXY"
 以上顺序对表中全部模型、变体及其他透传模型统一适用。用户明确指定 `--endpoint images`、`--endpoint chat` 或自定义端点时只调用指定端点，不自动切换。
 
 输出数量通过 `--count 1|2|3|4` 设置，默认 1，超过 4 会在请求前拦截；这是 Skill 的本地限制。Images 文生图/编辑传入 `n`，Chat 按张请求，始终保持用户选择的模型、提示词、尺寸和参考图。多张使用后台 `start` 并查询同一个 job；已保存图片后不自动补发或重跑其他端点。平台少返回或后续出错时保留已有图片，通过 `requested_count` / `returned_count` / `count_complete` 报告实际完成数量，不把部分结果称为全部完成。输入参考图仍最多 15 张，与输出最多 4 张互相独立。
+
+### 提示词模式与设计指引
+
+| 模式 | 行为 | 参数 |
+| --- | --- | --- |
+| 克制模式 | 完全使用用户的视觉提示词，不修改文字、标点或空白 | `--prompt-mode restrained` |
+| 创意模式 | 保留原意，补充模糊表述，做简短修饰 | `--prompt-mode creative` |
+| 大师模式 | 保留目标与硬性要求，优化概念、构图、色彩、材质、光线与文字层级 | `--prompt-mode master` |
+
+查询模型后会同时展示三种模式，不自动代选。可以回复“模型名，2 张，大师模式，咖啡海报，复古印刷风”；已提供的信息不用再次输入。模式确定但尚无内容时再输入提示词。创意/大师由 Codex 整理最终文本，客户端通过 `--prompt` 原样发送，不额外请求文本模型；无需为常规优化再确认一遍，高分辨率或关键歧义仍按原流程确认。
+
+海报、UI/UX、人物、商品、信息图等配方位于 [设计指引](skills/keylink-image/references/design-recipes.md)，模式边界见 [提示词流程](skills/keylink-image/references/prompting.md)。参考 [awesome-gpt-image-2](https://github.com/freestylefly/awesome-gpt-image-2) 的分类与排版方法，以及 [editorial-allure-prompting](https://github.com/we1jia/editorial-allure-prompting) 中适当的摄影/服装描述，来源与 MIT 许可见 [sources.md](skills/keylink-image/references/sources.md)。不引入保证过审或拒绝后自动改写的流程。
+
+指定文案、人物身份、参考图作用和编辑保留项优先；大师模式也不会将“只改标题”变为整图重设计。克制模式不做词汇替换。创意/大师仅将适当的模糊审美描述转为具体视觉语言，不改变不允许的意图来绕过审核。
+
+`models` 返回 `prompt_mode_choices`；`run` 的成功或已尝试发送后的端点失败结果返回 `prompt_mode` 和 `sent_prompt`，`last` 和完成的 `status` 也保留它们。`start` 或发送前的本地体积拦截只返回 `prepared_prompt`，表示准备的输入，不能证明已提交。`sent_prompt` 也不代表服务端已成功接收或生成。旧记录缺少提示词时不会补造。结果展示原文/优化稿时直接使用保存的 `sent_prompt`，不再重写。
+
+带模式的编辑命令若混入会话包装，会在本地拒绝并要求干净的视觉提示词，避免悄悄改变原文；旧命令不带 `--prompt-mode` 时仍兼容原来的包装清理。手动调用必须自行准备最终 `--prompt`，仅添加模式参数不会让 Python 自动优化。
+
+多行、引号、精确空白或 shell 特殊字符使用 UTF-8 文件输入：将最终提示词原样写入本地文件，通过 `--prompt-file "<文件路径>"` 替代 `--prompt`，避免命令行转义改变文字；文件内容不会作为 shell 命令执行。文件读取忽略可选的 UTF-8 BOM 编码标记，保留正文、空白和 CRLF/LF；空文件或只有编码标记的文件会被本地拦截。后台作业保存文本快照，不依赖原提示词文件继续存在，提示词以短横线开头也可正常传递。
 
 ### 高分辨率与等待
 
@@ -131,12 +153,12 @@ export HTTP_PROXY="$HTTPS_PROXY"
 sh "$skill_dir/scripts/keylink-image.sh" models
 # 用户从本次返回的模型列表选择模型和数量后，再使用返回的 selection_token：
 sh "$skill_dir/scripts/keylink-image.sh" run \
-  --prompt "海边的灯塔" --model "gpt-image-2" \
+  --prompt "海边的灯塔" --prompt-mode restrained --model "gpt-image-2" \
   --selection-token "<本次查询返回的凭证>" --count 1 --aspect landscape
 
 # 2K/4K 使用后台作业；start 返回 job_id，随后查询 status
 sh "$skill_dir/scripts/keylink-image.sh" start \
-  --prompt "黑洞" --model "gpt-image-2.5" \
+  --prompt "黑洞" --prompt-mode restrained --model "gpt-image-2.5" \
   --selection-token "<本次查询返回的凭证>" --size "3840x2160" --confirm-high-res
 sh "$skill_dir/scripts/keylink-image.sh" status --job-id "<job_id>" --thread-id "<thread_id>"
 ```
