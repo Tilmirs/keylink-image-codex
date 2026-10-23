@@ -51,8 +51,8 @@ EXPERIMENTAL_SIZES = ("2560x1440", "3840x2160")
 OUTPUT_MAX_COUNT = 4
 PROMPT_MODES = (
     {"id": "restrained", "label": "克制模式", "description": "完全使用用户提示词，不做任何修改"},
-    {"id": "creative", "label": "创意模式", "description": "以用户提示词为基础，补充模糊语句，做简短修饰"},
     {"id": "master", "label": "大师模式", "description": "保留用户目标和硬性要求，全面优化提示词后生成"},
+    {"id": "professional", "label": "专业模式", "description": "先选择风格参考图，再调优提示词并与素材图一起作为参考"},
 )
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
 DATA_URL_RE = re.compile(
@@ -2835,7 +2835,7 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     prompt.add_argument("--prompt-file", help="Read the exact final prompt from a UTF-8 file; avoids shell quoting changes.")
     parser.add_argument(
         "--prompt-mode", choices=tuple(mode["id"] for mode in PROMPT_MODES),
-        help="Prompt mode selected with Codex: restrained, creative, or master. "
+        help="Prompt mode selected with Codex: restrained, master, or professional. "
              "Codex prepares --prompt; this client never calls a text model or "
              "semantically rewrites it. Omit for legacy edit-wrapper cleanup.",
     )

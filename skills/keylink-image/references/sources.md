@@ -1,6 +1,6 @@
 # 设计参考与许可
 
-提示词方法整合于 2026-10-22。`prompting.md` 与 `design-recipes.md` 参考以下项目并按本 Skill 的三种模式、参考图编辑与返回实际提示词流程重新编写；不需要额外安装上游 Skill。
+提示词方法整合于 2026-10-22。`prompting.md` 与 `design-recipes.md` 参考以下项目并按本 Skill 的克制、大师、专业三种模式、参考图编辑与返回实际提示词流程重新编写；不需要额外安装上游 Skill。
 
 - [freestylefly/awesome-gpt-image-2](https://github.com/freestylefly/awesome-gpt-image-2)：参考 `agents/skills/gpt-image-2-style-library/SKILL.md`、`references/style-library.md` 和 `docs/templates.md` 的交付物分类、海报层级、UI 布局、人物/摄影、商品与信息图要点。已读取文件的 Git blob：`4186ace84e7676e939d2f4b351be9b1149a272f8`、`56938069ca5876c2e5730283f056f4ff79c95b28`、`c2431bad7236887721cbc42fd9418bbd48ead6f2`。
 - [we1jia/editorial-allure-prompting](https://github.com/we1jia/editorial-allure-prompting)：参考正常的摄影描述、服装材质、自然肤质，以及区分时装与生活抓拍的思路；没有引入规避审核词表、拒绝后自动改写或保证过审的内容。已读取 `SKILL.md` 与 `references/prompt-templates.md` 的 Git blob：`e5cb8c13ecfb49d350fe6d2c35ad8a2d341dc16c`、`e6e2f95d9fb1fb58efc3124d76e15033ee5c8d6e`。

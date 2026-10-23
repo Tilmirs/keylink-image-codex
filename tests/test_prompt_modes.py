@@ -17,7 +17,7 @@ from test_output_count import MemoryClient, memory_server, response
 
 c = fixtures.client_module
 MODEL = "gpt-image-2.5-flare"
-MODES = ("restrained", "creative", "master")
+MODES = ("restrained", "master", "professional")
 
 
 def multipart_fields(request):
@@ -43,6 +43,9 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
             done, result = self.run_client(Path(tmp), server, "models")
             self.assertEqual(done.returncode, 0, done.stdout)
             self.assertEqual([entry["id"] for entry in result["prompt_mode_choices"]], list(MODES))
+            self.assertNotIn("creative", [entry["id"] for entry in result["prompt_mode_choices"]])
+            professional = next(entry for entry in result["prompt_mode_choices"] if entry["id"] == "professional")
+            self.assertIn("参考图", professional["description"])
             self.assertTrue(result["prompt_mode_required"])
             self.assertNotIn("default_prompt_mode", result)
             self.assertEqual([r["method"] for r in server.requests], ["GET"])
@@ -200,7 +203,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
              mock.patch.object(c, "REQUEST_MAX_BYTES", 16):
             prompt = "a visual description that cannot fit the fixture body limit"
             done, result = self.run_client(Path(tmp), server, "run", "--model", MODEL,
-                                           "--prompt", prompt, "--prompt-mode", "creative")
+                                           "--prompt", prompt, "--prompt-mode", "professional")
             self.assertEqual(done.returncode, 1, done.stdout)
             self.assertEqual(result["prepared_prompt"], prompt)
             self.assertNotIn("sent_prompt", result)
