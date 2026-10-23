@@ -1,10 +1,13 @@
 """Prevent stale/refused image results and bound duplicated Chat references."""
 import base64
+import contextlib
+import errno
 import io
 import json
 import os
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from unittest import mock
 
@@ -16,6 +19,51 @@ Image = fixtures.Image
 
 class ResultIntegrityTests(unittest.TestCase):
     run_client = fixtures.KeylinkImageTests.run_client
+
+    def test_host_network_permission_failure_releases_selection_for_exact_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp) / "state"
+            base = "http://127.0.0.1:4321"
+            token = c.save_model_selection(state, [{"id": "gpt-image-2"}], base)
+            args = c.build_parser().parse_args([
+                "run", "--prompt", "a tree", "--model", "gpt-image-2",
+                "--selection-token", token, "--base-url", base,
+            ])
+            denied = urllib.error.URLError(PermissionError(errno.EACCES, "access denied"))
+
+            def raise_denied(*_args, **_kwargs):
+                try:
+                    raise denied
+                except urllib.error.URLError as cause:
+                    raise c.ClientError("Request failed for fixture: [WinError 10013] access denied") from cause
+
+            first_output = io.StringIO()
+            with mock.patch.object(c, "thread_state_dir", return_value=state), \
+                 mock.patch.object(c, "discover_base_url", return_value=(base, "argument", c.CCSwitchState())), \
+                 mock.patch.object(c, "discover_api_key", return_value=("fixture-key", "test")), \
+                 mock.patch.object(c.HttpClient, "_open", side_effect=raise_denied), \
+                 contextlib.redirect_stdout(first_output):
+                self.assertEqual(c.command_run(args), 1)
+            blocked = json.loads(first_output.getvalue())
+            self.assertTrue(blocked["retryable_host_network_error"])
+            self.assertTrue(blocked["selection_token_released"])
+            self.assertIn("WinError 10013/EACCES", blocked["error"])
+            self.assertIn("prepared_prompt", blocked)
+            self.assertNotIn("sent_prompt", blocked)
+            self.assertFalse(blocked["ask_user_to_switch_model"])
+            c.validate_model_selection(state, token, "gpt-image-2", base)
+
+            response = (json.dumps({"b64_json": fixtures.PNG_B64}).encode("utf-8"), "application/json")
+            second_output = io.StringIO()
+            with mock.patch.object(c, "thread_state_dir", return_value=state), \
+                 mock.patch.object(c, "discover_base_url", return_value=(base, "argument", c.CCSwitchState())), \
+                 mock.patch.object(c, "discover_api_key", return_value=("fixture-key", "test")), \
+                 mock.patch.object(c.HttpClient, "_open", return_value=response), \
+                 contextlib.redirect_stdout(second_output):
+                self.assertEqual(c.command_run(args), 0)
+            succeeded = json.loads(second_output.getvalue())
+            self.assertEqual(succeeded["returned_count"], 1)
+            self.assertEqual(succeeded["sent_prompt"], "a tree")
 
     def test_status_does_not_present_earlier_job_as_current(self):
         with tempfile.TemporaryDirectory() as tmp:

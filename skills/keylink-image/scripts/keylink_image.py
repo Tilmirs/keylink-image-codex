@@ -52,7 +52,7 @@ OUTPUT_MAX_COUNT = 4
 PROMPT_MODES = (
     {"id": "restrained", "label": "克制模式", "description": "完全使用用户提示词，不做任何修改"},
     {"id": "master", "label": "大师模式", "description": "保留用户目标和硬性要求，全面优化提示词后生成"},
-    {"id": "professional", "label": "专业模式", "description": "先选择风格参考图，再调优提示词并与素材图一起作为参考"},
+    {"id": "professional", "label": "专业模式", "description": "仅从花瓣、搞定设计、Pinterest、Dribbble 每批选择 10 张风格参考图，再调优提示词并与素材图一起作为参考"},
 )
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
 DATA_URL_RE = re.compile(
@@ -108,6 +108,40 @@ CORRECTION_INTENT_RE = re.compile(
 
 class ClientError(RuntimeError):
     """Expected user-facing client failure."""
+
+
+def is_host_network_permission_error(error: BaseException) -> bool:
+    """Return whether an error is a pre-request host network permission denial.
+
+    urllib wraps socket errors in URLError and the client wraps those in
+    ClientError. Walk the complete chain so a denied Windows socket (10013)
+    remains distinguishable from an HTTP/API failure that consumed a request.
+    """
+    pending: list[BaseException] = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        winerror = getattr(current, "winerror", None)
+        err_number = getattr(current, "errno", None)
+        if (
+            isinstance(current, PermissionError)
+            or winerror == 10013
+            or err_number in {errno.EACCES, errno.EPERM}
+        ):
+            return True
+        if isinstance(current, urllib.error.URLError):
+            reason = getattr(current, "reason", None)
+            if isinstance(reason, BaseException):
+                pending.append(reason)
+        for attribute in ("__cause__", "__context__"):
+            nested = getattr(current, attribute, None)
+            if isinstance(nested, BaseException):
+                pending.append(nested)
+    return False
 
 
 class RefusalError(ClientError):
@@ -1292,6 +1326,29 @@ def consume_model_selection(
         data["used_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
         write_json_file(state_dir / "model-selection.json", data)
         _record_image_request_unlocked(state_dir, selection_token, model)
+
+
+def release_model_selection_for_host_retry(
+    state_dir: Path, selection_token: str, reason: str,
+) -> bool:
+    """Release a consumed token when every endpoint was blocked before HTTP.
+
+    A host permission failure such as Windows WinError 10013 cannot reach the
+    provider and therefore cannot spend the one-use selection. Keeping the
+    token valid lets the host-permission retry reuse the user's model choice.
+    """
+    with image_state_lock(state_dir):
+        target = state_dir / "model-selection.json"
+        data = read_json_file(target)
+        if not isinstance(data, dict) or data.get("token") != selection_token:
+            return False
+        if not data.get("used_at"):
+            return False
+        data["used_at"] = None
+        data["released_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        data["release_reason"] = reason
+        write_json_file(target, data)
+        return True
 
 
 def image_request_id(selection_token: str) -> str:
@@ -2791,7 +2848,8 @@ def command_run(args: argparse.Namespace) -> int:
                 phase = "provider_refusal"
             attempt = {"endpoint": endpoint_label, "error": str(error), "phase": phase,
                        "elapsed_seconds": round(time.monotonic() - started, 3),
-                       "candidate_count": len(candidates)}
+                       "candidate_count": len(candidates),
+                       "host_network_permission_error": is_host_network_permission_error(error)}
             if response is not None:
                 attempt["response_shape"] = response_shape(response)
             attempts.append(attempt)
@@ -2800,14 +2858,44 @@ def command_run(args: argparse.Namespace) -> int:
 
     automatic = args.endpoint == "auto"
     refused = any(item.get("phase") == "provider_refusal" for item in attempts)
+    host_network_permission_error = bool(attempts) and all(
+        item.get("host_network_permission_error") is True for item in attempts
+    )
+    selection_token_released = False
+    if host_network_permission_error:
+        selection_token_released = release_model_selection_for_host_retry(
+            state_dir,
+            args.selection_token,
+            "all attempted image endpoints were blocked by host network permissions",
+        )
+    if host_network_permission_error:
+        error_message = (
+            "Image request did not reach the provider: every attempted endpoint was "
+            "blocked by host network permissions (for example WinError 10013/EACCES). "
+            "No image was submitted. Retry the same command after allowing host "
+            "network access; the model selection remains valid."
+        )
+    else:
+        error_message = (
+            "The provider refused this request; no new image was saved."
+            if refused
+            else "Image request failed; no new image was saved. See attempts for endpoint errors."
+        )
+    failure_prompt = (
+        {"sent_prompt": args.prompt}
+        if not host_network_permission_error and client.last_request_bytes is not None
+        else {"prepared_prompt": args.prompt}
+    )
     finish_image_request(state_dir, args.selection_token, "refused" if refused else "failed")
     emit(
         {
             "status": "error",
             "request_id": image_request_id(args.selection_token),
-            "error": "The provider refused this request; no new image was saved." if refused else "Image request failed; no new image was saved. See attempts for endpoint errors.",
+            "error": error_message,
             "current_request_succeeded": False,
             "provider_refused": refused,
+            "retryable_host_network_error": host_network_permission_error,
+            "selection_token_released": selection_token_released,
             "requested_count": args.count, "returned_count": 0, "count_complete": False,
             "model": model,
             "requested_size": size,
@@ -2816,14 +2904,21 @@ def command_run(args: argparse.Namespace) -> int:
             "reference_limit_source": prepared_input["reference_limit_source"],
             "prompt_info": prepared_input["prompt_info"],
             "prompt_mode": prepared_input.get("prompt_mode"),
-            **({"sent_prompt": args.prompt} if client.last_request_bytes is not None
-               else {"prepared_prompt": args.prompt}),
+            **failure_prompt,
             "request_attempts": client.request_attempts,
             "warnings": prepared_input["reference_warnings"],
             "base_url": base_url,
             "base_url_source": base_source,
             "attempts": attempts,
-            "ask_user_to_switch_model": not refused and automatic and len(attempts) > 1,
+            "ask_user_to_switch_model": (
+                not refused and not host_network_permission_error
+                and automatic and len(attempts) > 1
+            ),
+            "recommended_action": (
+                "Retry this exact command with approved host network permissions; "
+                "do not run models again unless the catalog or API host changed."
+                if host_network_permission_error else None
+            ),
         }
     )
     return 1
