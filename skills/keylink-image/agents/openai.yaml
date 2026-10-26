@@ -1,7 +1,7 @@
 interface:
   display_name: "Keylink Image"
-  short_description: "Create Keylink images with three prompt modes"
+  short_description: "Create Keylink images in exploration or professional mode"
   brand_color: "#0F766E"
-  default_prompt: "Use $keylink-image to list models, choose a prompt mode, and generate or edit an image through Keylink."
+  default_prompt: "Use $keylink-image to list models and generate or edit through Keylink, using exploration mode by default or professional references when requested."
 policy:
   allow_implicit_invocation: true

@@ -49,9 +49,9 @@ DEFAULT_MODEL_PRIORITY = (
 CONSERVATIVE_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 EXPERIMENTAL_SIZES = ("2560x1440", "3840x2160")
 OUTPUT_MAX_COUNT = 4
+DEFAULT_PROMPT_MODE = "exploration"
 PROMPT_MODES = (
-    {"id": "restrained", "label": "克制模式", "description": "沿用三模式引入前的生成与编辑流程，不额外套用设计优化"},
-    {"id": "master", "label": "大师模式", "description": "以用户需求为创作简报，保留硬性要求，主动发展概念、构图、背景、光线和细节"},
+    {"id": "exploration", "label": "探索模式", "description": "默认模式，沿用原有生成与编辑流程，不额外套用设计优化"},
     {"id": "professional", "label": "专业模式", "description": "从花瓣、搞定设计、Pinterest、Dribbble 每批展示 4 张风格参考图，选定后深度设计并与素材图一起生成"},
 )
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
@@ -1622,7 +1622,7 @@ def prepare_request_inputs(
     # Explicit references (including --use-last) determine the image operation.
     # generate only disables implicit reuse based on correction wording.
     prompt, info = sanitize_edit_prompt(
-        args.prompt, preserve_text=getattr(args, "prompt_mode", None) in ("master", "professional"),
+        args.prompt, preserve_text=getattr(args, "prompt_mode", DEFAULT_PROMPT_MODE) == "professional",
     ) if references else (args.prompt, {
         "compacted": False, "original_chars": len(args.prompt),
         "sent_chars": len(args.prompt), "sent_bytes": len(args.prompt.encode("utf-8")),
@@ -1635,7 +1635,7 @@ def prepare_request_inputs(
     size = validate_size_request(args, preparation.items)
     return {
         "prompt": prompt, "prompt_info": info, "reference_source": source,
-        "prompt_mode": getattr(args, "prompt_mode", None),
+        "prompt_mode": getattr(args, "prompt_mode", DEFAULT_PROMPT_MODE),
         "requested_size": size,
         "size_source": ("explicit-size" if args.size else "explicit-aspect" if args.aspect
                         else "original-reference" if references else "default-square"),
@@ -2664,7 +2664,8 @@ def command_models(args: argparse.Namespace) -> int:
             "default_output_count": 1,
             "max_output_count": OUTPUT_MAX_COUNT,
             "prompt_mode_choices": list(PROMPT_MODES),
-            "prompt_mode_required": True,
+            "prompt_mode_required": False,
+            "default_prompt_mode": DEFAULT_PROMPT_MODE,
             "preferred_sizes": list(CONSERVATIVE_SIZES),
             "experimental_sizes": list(EXPERIMENTAL_SIZES),
             "four_k_notice": (
@@ -2930,9 +2931,10 @@ def add_run_arguments(parser: argparse.ArgumentParser) -> None:
     prompt.add_argument("--prompt-file", help="Read the exact final prompt from a UTF-8 file; avoids shell quoting changes.")
     parser.add_argument(
         "--prompt-mode", choices=tuple(mode["id"] for mode in PROMPT_MODES),
-        help="Prompt mode selected with Codex: restrained, master, or professional. "
+        default=DEFAULT_PROMPT_MODE,
+        help="Prompt mode: exploration (default) or professional. "
              "Codex prepares --prompt; this client never calls a text model or "
-             "semantically rewrites it. Omit for legacy edit-wrapper cleanup.",
+             "semantically rewrites it. Exploration uses the original generation/edit workflow.",
     )
     parser.add_argument("--model")
     parser.add_argument("--selection-token")

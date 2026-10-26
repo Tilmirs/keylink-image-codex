@@ -17,7 +17,7 @@ from test_output_count import MemoryClient, memory_server, response
 
 c = fixtures.client_module
 MODEL = "gpt-image-2.5-flare"
-MODES = ("restrained", "master", "professional")
+MODES = ("exploration", "professional")
 
 
 def multipart_fields(request):
@@ -37,7 +37,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_models_offers_modes_without_post_or_default_mode(self):
+    def test_models_offers_two_modes_and_exploration_default_without_post(self):
         with tempfile.TemporaryDirectory() as tmp, memory_server() as server:
             server.routes[("GET", "/v1/models")] = fixtures.json_response({"data": [{"id": MODEL}]})
             done, result = self.run_client(Path(tmp), server, "models")
@@ -46,8 +46,8 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
             self.assertNotIn("creative", [entry["id"] for entry in result["prompt_mode_choices"]])
             professional = next(entry for entry in result["prompt_mode_choices"] if entry["id"] == "professional")
             self.assertIn("参考图", professional["description"])
-            self.assertTrue(result["prompt_mode_required"])
-            self.assertNotIn("default_prompt_mode", result)
+            self.assertFalse(result["prompt_mode_required"])
+            self.assertEqual(result["default_prompt_mode"], "exploration")
             self.assertEqual([r["method"] for r in server.requests], ["GET"])
 
     def test_final_text_survives_images_to_chat_with_multiple_references(self):
@@ -58,7 +58,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                      tempfile.TemporaryDirectory() as tmp, memory_server() as server:
                     root = Path(tmp)
                     prompt = '  海报标题：“慢一点 · 2026”\n\n\n保留 Logo A/B；不要改文字。  '
-                    expected_prompt = c.sanitize_edit_prompt(prompt)[0] if editing and mode == "restrained" else prompt
+                    expected_prompt = c.sanitize_edit_prompt(prompt)[0] if editing and mode == "exploration" else prompt
                     options = ["--mode", "generate"]
                     if editing:
                         for index in range(2):
@@ -74,7 +74,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                     self.assertEqual(result["sent_prompt"], expected_prompt)
                     self.assertEqual(result["prompt_mode"], mode)
                     self.assertEqual(result["prompt_info"]["sent_bytes"], len(expected_prompt.encode("utf-8")))
-                    self.assertEqual(result["prompt_info"]["compacted"], editing and mode == "restrained")
+                    self.assertEqual(result["prompt_info"]["compacted"], editing and mode == "exploration")
                     self.assertEqual([r["path"] for r in server.requests], [route, "/v1/chat/completions"])
                     images_request, chat_request = server.requests
                     if editing:
@@ -103,7 +103,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                     self.assertEqual(server.requests, [])
 
     def test_authored_modes_reject_wrappers_without_rewriting_or_consuming_selection(self):
-        for mode in ("master", "professional"):
+        for mode in ("professional",):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp, memory_server() as server:
                 root = Path(tmp)
                 ref = root / "ref.png"
@@ -120,6 +120,39 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                     launch.assert_not_called()
                 self.assertEqual(server.requests, [])
 
+    def test_default_generation_preserves_prompt_and_records_exploration(self):
+        with tempfile.TemporaryDirectory() as tmp, memory_server() as server:
+            root = Path(tmp)
+            prompt = '  灯塔，标题“归航”。\n\n\n保持  空格。  '
+            server.routes[("POST", "/v1/images/generations")] = fixtures.json_response(response(1))
+            done, result = self.run_client(root, server, "run", "--model", MODEL,
+                                           "--mode", "generate", "--prompt", prompt)
+            self.assertEqual(done.returncode, 0, done.stdout)
+            self.assertEqual(result["prompt_mode"], "exploration")
+            self.assertEqual(result["sent_prompt"], prompt)
+            self.assertEqual(json.loads(server.requests[0]["body"])["prompt"], prompt)
+            server.requests.clear()
+            done, recovered = self.run_client(root, server, "last")
+            self.assertEqual(done.returncode, 0, done.stdout)
+            self.assertEqual(recovered["prompt_mode"], "exploration")
+            self.assertEqual(recovered["sent_prompt"], prompt)
+            self.assertEqual(server.requests, [])
+
+    def test_removed_modes_stop_before_credentials_token_or_launch(self):
+        for command in ("run", "start"):
+            for mode in ("master", "restrained", "creative"):
+                with self.subTest(command=command, mode=mode), \
+                     mock.patch.object(c, "discover_api_key") as credentials, \
+                     mock.patch.object(c, "consume_model_selection") as consume, \
+                     mock.patch.object(c.subprocess, "Popen") as launch, \
+                     mock.patch("sys.stderr", new_callable=io.StringIO), \
+                     self.assertRaises(SystemExit) as stopped:
+                    c.main([command, "--model", MODEL, "--prompt", "a tree", "--prompt-mode", mode])
+                self.assertEqual(stopped.exception.code, 2)
+                credentials.assert_not_called()
+                consume.assert_not_called()
+                launch.assert_not_called()
+
     def test_legacy_edit_cleanup_remains_and_reports_actual_cleaned_prompt(self):
         with tempfile.TemporaryDirectory() as tmp, memory_server() as server:
             root = Path(tmp)
@@ -129,11 +162,11 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
             done, result = self.run_client(root, server, "run", "--model", MODEL, "--image", str(ref),
                                            "--prompt", "user: old\nassistant: done\nuser: change title")
             self.assertEqual(done.returncode, 0, done.stdout)
-            self.assertIsNone(result["prompt_mode"])
+            self.assertEqual(result["prompt_mode"], "exploration")
             self.assertEqual(result["sent_prompt"], "change title")
             self.assertTrue(result["prompt_info"]["compacted"])
 
-    def test_restrained_edit_restores_pre_mode_wrapper_cleanup_and_fallback(self):
+    def test_exploration_edit_restores_pre_mode_wrapper_cleanup_and_fallback(self):
         expected = '只将标题改为“慢一点”。\n\n保留人物与 Logo A/B。'
         wrappers = (
             'user: 旧要求\nassistant: 已完成\nuser: ' + expected,
@@ -152,11 +185,11 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                 server.routes[("POST", "/v1/images/edits")] = (500, "application/json", {"error": "fixture"})
                 server.routes[("POST", "/v1/chat/completions")] = fixtures.json_response(response(1))
                 done, result = self.run_client(root, server, "run", "--model", MODEL,
-                                               "--prompt-mode", "restrained", "--image", str(ref),
+                                               "--prompt-mode", "exploration", "--image", str(ref),
                                                "--prompt", prompt)
                 self.assertEqual(done.returncode, 0, done.stdout)
                 self.assertEqual(result["sent_prompt"], expected)
-                self.assertEqual(result["prompt_mode"], "restrained")
+                self.assertEqual(result["prompt_mode"], "exploration")
                 self.assertTrue(result["prompt_info"]["compacted"])
                 self.assertEqual([v for k, v in multipart_fields(server.requests[0]) if k == "prompt"],
                                  [expected.encode("utf-8")])
@@ -169,12 +202,13 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                 self.assertEqual(server.requests, [])
 
     def test_background_edit_keeps_mode_prompt_snapshots_count_and_recovery(self):
-        for mode in MODES:
-            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp, memory_server() as server:
+        for selected_mode in (None, *MODES):
+            mode = selected_mode or "exploration"
+            with self.subTest(mode=selected_mode), tempfile.TemporaryDirectory() as tmp, memory_server() as server:
                 root = Path(tmp)
                 prompt = '  只将标题改为“春日 · 01”。\n保留图 1 主体、图 2 配色与 50% 字样。  '
                 expected_prompt = prompt
-                if mode == "restrained":
+                if mode == "exploration":
                     expected_prompt = prompt.strip()
                     prompt = json.dumps({"prompt": prompt}, ensure_ascii=False)
                 refs = [root / f"reference {index}.png" for index in range(2)]
@@ -184,8 +218,8 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                     options += ["--image", str(ref)]
                 with mock.patch.object(c.subprocess, "Popen", return_value=mock.Mock(pid=123)):
                     done, job = self.run_client(root, server, "start", "--model", MODEL,
-                                                "--prompt", prompt, "--prompt-mode", mode,
-                                                "--count", "2", *options)
+                                                "--prompt", prompt, "--count", "2", *options,
+                                                *(["--prompt-mode", selected_mode] if selected_mode else []))
                 self.assertEqual(done.returncode, 0, done.stdout)
                 self.assertEqual(job["prepared_prompt"], expected_prompt)
                 self.assertNotIn("sent_prompt", job)  # Started does not mean submitted.
@@ -229,11 +263,11 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
             server.routes[("POST", "/v1/images/generations")] = fixtures.json_response(
                 {"choices": [{"message": {"refusal": "Policy refusal fixture"}}]})
             done, result = self.run_client(Path(tmp), server, "run", "--model", MODEL,
-                                           "--prompt", prompt, "--prompt-mode", "master")
+                                           "--prompt", prompt, "--prompt-mode", "professional")
             self.assertEqual(done.returncode, 1, done.stdout)
             self.assertTrue(result["provider_refused"])
             self.assertEqual(result["sent_prompt"], prompt)
-            self.assertEqual(result["prompt_mode"], "master")
+            self.assertEqual(result["prompt_mode"], "professional")
             self.assertNotIn("images", result)
             self.assertEqual(len(server.requests), 1)
             self.assertNotIn("local-test-key", done.stdout)
@@ -312,7 +346,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
             path.write_bytes(prompt.encode("utf-8-sig"))
             server.routes[("POST", "/v1/images/generations")] = fixtures.json_response(response(1))
             done, result = self.run_client(root, server, "run", "--model", MODEL,
-                                           "--mode", "generate", "--prompt-mode", "restrained",
+                                           "--mode", "generate", "--prompt-mode", "exploration",
                                            "--prompt-file", str(path))
             self.assertEqual(done.returncode, 0, done.stdout)
             self.assertEqual(result["sent_prompt"], prompt)
@@ -326,7 +360,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                 path.write_bytes(prompt.encode("utf-8-sig"))
                 with mock.patch.object(c.subprocess, "Popen", return_value=mock.Mock(pid=123)):
                     done, job = self.run_client(root, server, "start", "--model", MODEL,
-                                                "--mode", "generate", "--prompt-mode", "restrained",
+                                                "--mode", "generate", "--prompt-mode", "exploration",
                                                 "--prompt-file", str(path))
                 self.assertEqual(done.returncode, 0, done.stdout)
                 self.assertEqual(job["prepared_prompt"], prompt)
@@ -344,7 +378,7 @@ class PromptModeTests(MemoryClient, unittest.TestCase):
                 result = c.read_json_file(directory / "result.json")
                 self.assertEqual(result["status"], "ok", result)
                 self.assertEqual(result["sent_prompt"], prompt)
-                self.assertEqual(result["prompt_mode"], "restrained")
+                self.assertEqual(result["prompt_mode"], "exploration")
                 self.assertEqual(len(server.requests), 1)
                 self.assertEqual(json.loads(server.requests[0]["body"])["prompt"], prompt)
 
@@ -374,14 +408,14 @@ class PromptFileLauncherTests(unittest.TestCase):
             token = c.save_model_selection(root / "state" / "launcher-test", [{"id": MODEL}], base)
             server.routes[("POST", "/v1/images/generations")] = fixtures.json_response(response(1))
             done = subprocess.run(launcher + ["run", "--model", MODEL, "--mode", "generate",
-                                  "--prompt-mode", "restrained", "--prompt-file", str(prompt_path),
+                                  "--prompt-mode", "exploration", "--prompt-file", str(prompt_path),
                                   "--selection-token", token, "--thread-id", "launcher-test",
                                   "--base-url", base], cwd=root, env=env, capture_output=True,
                                   encoding="utf-8", timeout=30)
             self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
             result = json.loads(done.stdout)
             self.assertEqual(result["sent_prompt"], prompt)
-            self.assertEqual(result["prompt_mode"], "restrained")
+            self.assertEqual(result["prompt_mode"], "exploration")
             self.assertEqual(json.loads(server.requests[0]["body"])["prompt"], prompt)
             self.assertEqual(len(server.requests), 1)
 
