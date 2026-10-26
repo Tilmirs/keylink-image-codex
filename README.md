@@ -134,7 +134,7 @@ export HTTP_PROXY="$HTTPS_PROXY"
 
 海报、UI/UX、人物、商品、信息图等配方位于 [设计指引](skills/keylink-image/references/design-recipes.md)，模式边界见 [提示词流程](skills/keylink-image/references/prompting.md)。新增 [自媒体设计指引](skills/keylink-image/references/social-media.md)：覆盖小红书封面/笔记配图、抖音/视频号封面与视频插图、公众号头图/正文图、B 站封面、知乎知识配图，以及生活方式、教程科普、人物 IP、产品种草等方向。专业模式检索到的图片只作为用户选择后的参考，按交付物与主题调优；平台名不自动触发额外尺寸或批量请求。
 
-专业模式以一个强概念统筹完整画面，细化背景、前后景、构图动线、光源/阴影/反射、色彩、材质、字体和辅助元素。允许主动创作场景、道具、图形、视觉隐喻与非事实性文案；不设只补几项的限额，不默认附加禁止额外元素、装饰或文字的负向清单。精确文案、事实、身份与明确保留范围仍优先，无字摄影和局部编辑按交付范围设计。设计指引提供 12 类场景的灵感，实际审美以生成图判断。
+专业模式以一个强概念统筹完整画面，细化背景、前后景、构图动线、光源/阴影/反射、色彩、材质、字体和辅助元素。用户未指定的设计交由 Codex 主动发挥：包括品牌/栏目命名、角色名、标题、副文案、图注、数字标签及其排版，形成完整的信息层；可读品牌、姓名与事实文字均可按项目使用，未命名概念可创作原创名称与成套设定。事实核对在内部完成，不默认附加禁止品牌、人物姓名、数字或其他文字的负向清单。精确文案、真实项目的信息与明确保留范围仍优先，无字摄影和局部编辑按交付范围设计。设计指引提供 12 类场景的灵感，实际审美以生成图判断。
 
 参考 [awesome-gpt-image-2](https://github.com/freestylefly/awesome-gpt-image-2) 的分类与排版方法，以及 [editorial-allure-prompting](https://github.com/we1jia/editorial-allure-prompting) 中适当的摄影/服装描述，来源与 MIT 许可见 [sources.md](skills/keylink-image/references/sources.md)。自媒体扩展为本 Skill 的设计指导，不宣称是平台官方规范。不引入保证过审或拒绝后自动改写的流程。
 
