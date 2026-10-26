@@ -50,9 +50,9 @@ CONSERVATIVE_SIZES = ("1024x1024", "1536x1024", "1024x1536")
 EXPERIMENTAL_SIZES = ("2560x1440", "3840x2160")
 OUTPUT_MAX_COUNT = 4
 PROMPT_MODES = (
-    {"id": "restrained", "label": "克制模式", "description": "完全使用用户提示词，不做任何修改"},
-    {"id": "master", "label": "大师模式", "description": "保留用户目标和硬性要求，全面优化提示词后生成"},
-    {"id": "professional", "label": "专业模式", "description": "仅从花瓣、搞定设计、Pinterest、Dribbble 每批选择 10 张风格参考图，再调优提示词并与素材图一起作为参考"},
+    {"id": "restrained", "label": "克制模式", "description": "沿用三模式引入前的生成与编辑流程，不额外套用设计优化"},
+    {"id": "master", "label": "大师模式", "description": "以用户需求为创作简报，保留硬性要求，主动发展概念、构图、背景、光线和细节"},
+    {"id": "professional", "label": "专业模式", "description": "从花瓣、搞定设计、Pinterest、Dribbble 每批展示 4 张风格参考图，选定后深度设计并与素材图一起生成"},
 )
 SIZE_RE = re.compile(r"(?<!\d)(\d{2,5})[xX](\d{2,5})(?!\d)")
 DATA_URL_RE = re.compile(
@@ -1622,7 +1622,7 @@ def prepare_request_inputs(
     # Explicit references (including --use-last) determine the image operation.
     # generate only disables implicit reuse based on correction wording.
     prompt, info = sanitize_edit_prompt(
-        args.prompt, preserve_text=getattr(args, "prompt_mode", None) is not None,
+        args.prompt, preserve_text=getattr(args, "prompt_mode", None) in ("master", "professional"),
     ) if references else (args.prompt, {
         "compacted": False, "original_chars": len(args.prompt),
         "sent_chars": len(args.prompt), "sent_bytes": len(args.prompt.encode("utf-8")),
